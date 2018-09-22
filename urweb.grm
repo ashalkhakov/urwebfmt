@@ -1,0 +1,2394 @@
+(* Copyright (c) 2008-2016, Adam Chlipala
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * - Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ * - Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ * - The names of contributors may not be used to endorse or promote products
+ *   derived from this software without specific prior written permission.
+ *
+ * THIS SOFTARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *)
+
+(* Grammar for Ur/Web programs *)
+
+open Source
+
+val s = ErrorMsg.spanOf
+val dummy = ErrorMsg.dummySpan
+
+fun capitalize "" = ""
+  | capitalize s = str (Char.toUpper (String.sub (s, 0))) ^ String.extract (s, 1, NONE)
+
+fun makeAttr s =
+    case s of
+        "type" => "Typ"
+      | "name" => "Nam"
+      | _ => capitalize (String.translate (fn ch => if ch = #"-" then "_" else str ch) s)
+
+fun entable t =
+    case #1 t of
+        TRecord c => c
+      | _ => t
+
+datatype select_item =
+         Field of con * con
+       | Exp of con option * exp
+       | Fields of con * con
+       | StarFields of con
+
+datatype select =
+         Star
+       | Items of select_item list
+
+datatype group_item =
+         GField of con * con
+       | GFields of con * con
+
+fun eqTnames ((c1, _), (c2, _)) =
+    case (c1, c2) of
+        (CVar (ms1, x1), CVar (ms2, x2)) => ms1 = ms2 andalso x1 = x2
+      | (CName x1, CName x2) => x1 = x2
+      | _ => false
+
+fun nameString (c, _) =
+    case c of
+        CName s => s
+      | CVar (_, x) => x
+      | _ => "?"
+
+datatype tableMode =
+         Unknown
+       | Everything
+       | Selective of con
+
+fun amend_select loc (si, (count, tabs, exps)) =
+    case si of
+        Field (tx, fx) =>
+        let
+            val c = (CRecord ([(fx, (CWild (KType, loc), loc))]), loc)
+
+            val (tabs, found) = ListUtil.foldlMap (fn ((tx', c'), found) =>
+                                                      if eqTnames (tx, tx') then
+                                                          case c' of
+                                                              Everything =>
+                                                              (ErrorMsg.errorAt loc
+                                                                                "Mixing specific-field and '*' selection of fields from same table";
+                                                               ((tx', c'), found))
+                                                            | Unknown =>
+                                                              ((tx', Selective c), true)
+                                                            | Selective c' =>
+                                                              ((tx', Selective (CConcat (c, c'), loc)), true)
+                                                      else
+                                                          ((tx', c'), found))
+                                                  false tabs
+        in
+            if found then
+                ()
+            else
+                ErrorMsg.errorAt loc ("Select of field " ^ nameString fx ^ " from unbound table " ^ nameString tx);
+
+            (count, tabs, exps)
+        end
+      | Fields (tx, fs) =>
+        let
+            val (tabs, found) = ListUtil.foldlMap (fn ((tx', c'), found) =>
+                                                      if eqTnames (tx, tx') then
+                                                          case c' of
+                                                              Everything =>
+                                                              (ErrorMsg.errorAt loc
+                                                                                "Mixing specific-field and '*' selection of fields from same table";
+                                                               ((tx', c'), found))
+                                                            | Selective c' =>
+                                                              ((tx', Selective (CConcat (fs, c'), loc)), true)
+                                                            | Unknown =>
+                                                              ((tx', Selective fs), true)
+                                                      else
+                                                          ((tx', c'), found))
+                                                  false tabs
+        in
+            if found then
+                ()
+            else
+                ErrorMsg.errorAt loc "Select of field from unbound table";
+
+            (count, tabs, exps)
+        end
+      | StarFields tx =>
+        if List.exists (fn (tx', c') => eqTnames (tx, tx') andalso case c' of
+                                                                       Unknown => false
+                                                                     | _ => true) tabs then
+            (ErrorMsg.errorAt loc "Selection with '*' from table already mentioned in same SELECT clause";
+             (count, tabs, exps))
+        else if List.all (fn (tx', c') => not (eqTnames (tx, tx'))) tabs then
+            (ErrorMsg.errorAt loc "Select of all fields from unbound table";
+             (count, tabs, exps))
+        else
+            (count, map (fn (tx', c') => (tx', if eqTnames (tx, tx') then Everything else c')) tabs, exps)
+      | Exp (SOME c, e) => (count, tabs, (c, e) :: exps)
+      | Exp (NONE, e) => (count+1, tabs, ((CName (Int.toString count), loc), e) :: exps)
+
+fun amend_group loc (gi, tabs) =
+    let
+        val (tx, c) = case gi of
+                          GField (tx, fx) => (tx, (CRecord ([(fx, (CWild (KType, loc), loc))]), loc))
+                        | GFields (tx, fxs) => (tx, fxs)
+
+        val (tabs, found) = ListUtil.foldlMap (fn ((tx', c'), found) =>
+                                                  if eqTnames (tx, tx') then
+                                                      ((tx', (CConcat (c, c'), loc)), true)
+                                                  else
+                                                      ((tx', c'), found))
+                                              false tabs
+    in
+        if found then
+            ()
+        else
+            ErrorMsg.errorAt loc "Select of field from unbound table";
+
+        tabs
+    end
+
+fun sql_inject (v, loc) =
+    (EApp ((EVar (["Basis"], "sql_inject", Infer), loc), (v, loc)), loc)
+
+fun sql_binary (oper, sqlexp1, sqlexp2, loc) =
+    let
+        val e = (EVar (["Basis"], "sql_binary", Infer), loc)
+        val e = (EApp (e, (EVar (["Basis"], "sql_" ^ oper, Infer), loc)), loc)
+        val e = (EApp (e, sqlexp1), loc)
+    in
+        (EApp (e, sqlexp2), loc)
+    end
+
+fun sql_unary (oper, sqlexp, loc) =
+    let
+        val e = (EVar (["Basis"], "sql_unary", Infer), loc)
+        val e = (EApp (e, (EVar (["Basis"], "sql_" ^ oper, Infer), loc)), loc)
+    in
+        (EApp (e, sqlexp), loc)
+    end
+
+fun sql_relop (oper, all, sqlexp1, sqlexp2, loc) =
+    let
+        val e = (EVar (["Basis"], "sql_relop", Infer), loc)
+        val e = (EApp (e, (EVar (["Basis"], "sql_" ^ oper, Infer), loc)), loc)
+        val e = (EApp (e, (EVar (["Basis"], if all then "True" else "False", Infer), loc)), loc)
+        val e = (EApp (e, sqlexp1), loc)
+    in
+        (EApp (e, sqlexp2), loc)
+    end
+
+fun sql_nfunc (oper, loc) =
+    let
+        val e = (EVar (["Basis"], "sql_nfunc", Infer), loc)
+    in
+        (EApp (e, (EVar (["Basis"], "sql_" ^ oper, Infer), loc)), loc)
+    end
+
+fun native_unop (oper, e1, loc) =
+    let
+        val e = (EVar (["Basis"], oper, Infer), loc)
+    in
+        (EApp (e, e1), loc)
+    end
+
+fun native_op (oper, e1, e2, loc) =
+    let
+        val e = (EVar (["Basis"], oper, Infer), loc)
+        val e = (EApp (e, e1), loc)
+    in
+        (EApp (e, e2), loc)
+    end
+
+fun top_binop (oper, e1, e2, loc) =
+    let
+        val e = (EVar (["Top"], oper, Infer), loc)
+        val e = (EApp (e, e1), loc)
+    in
+        (EApp (e, e2), loc)
+    end
+
+val inDml = ref false
+
+fun tagIn bt =
+    case bt of
+        "table" => "tabl"
+      | "url" => "url_"
+      | "datetime-local" => "datetime_local"
+      | "cdatetime-local" => "cdatetime_local"
+      | _ => bt
+
+datatype prop_kind = Delete | Update
+
+datatype attr = Class of exp | DynClass of exp | Style of exp | DynStyle of exp | Normal of con * exp | Data of string * string * exp
+
+fun patType loc (p : pat) =
+    case #1 p of
+        PAnnot (_, t) => t
+      | _ => (CWild (KType, loc), loc)
+
+fun tnamesOf (e, _) =
+    case e of
+        EApp (e1, e2) => tnamesOf e1 @ tnamesOf e2
+      | ECApp (e, c as (CName _, _)) =>
+        let
+            fun isFt (e, _) =
+                case e of
+                    EVar (["Basis"], "sql_from_table", _) => true
+                  | EVar ([], "sql_from_table", _) => true
+                  | ECApp (e, _) => isFt e
+                  | EApp (e, _) => isFt e
+                  | EDisjointApp e => isFt e
+                  | _ => false
+        in
+            (if isFt e then [c] else []) @ tnamesOf e
+        end
+      | ECApp (e, _) => tnamesOf e
+      | EDisjointApp e => tnamesOf e
+      | _ => []
+
+fun classOut (s, pos) =
+    let
+        val s = case s of
+                    "table" => "tabl"
+                  | _ => s
+    in
+        (EVar ([], String.translate (fn #"-" => "_" | ch => str ch) s, Infer), pos)
+    end
+
+fun parseClass s pos =
+    case String.tokens Char.isSpace s of
+        [] => (EVar (["Basis"], "null", Infer), pos)
+      | class :: classes =>
+        foldl (fn (s, e) => (EApp ((EApp ((EVar (["Basis"], "classes", Infer), pos), e), pos), classOut (s, pos)), pos))
+                (classOut (class, pos)) classes
+
+fun parseValue s pos =
+    if String.isPrefix "url(" s andalso String.isSuffix ")" s then
+        let
+            val s = String.substring (s, 4, size s - 5)
+
+            val s = if size s >= 2
+                       andalso ((String.isPrefix "\"" s andalso String.isSuffix "\"" s)
+                                orelse (String.isPrefix "'" s andalso String.isSuffix "'" s)) then
+                        String.substring (s, 1, size s - 2)
+                    else
+                        s
+        in
+            (EApp ((EVar (["Basis"], "css_url", Infer), pos),
+                   (EApp ((EVar (["Basis"], "bless", Infer), pos),
+                          (EPrim (Prim.String (Prim.Normal, s)), pos)), pos)), pos)
+        end
+    else
+        (EApp ((EVar (["Basis"], "atom", Infer), pos),
+               (EPrim (Prim.String (Prim.Normal, s)), pos)), pos)
+
+fun parseProperty s pos =
+    let
+        val (befor, after) = Substring.splitl (fn ch => ch <> #":") (Substring.full s)
+    in
+        if Substring.isEmpty after then
+            (ErrorMsg.errorAt pos ("Invalid CSS property syntax: " ^ s);
+             (EPrim (Prim.String (Prim.Normal, "")), pos))
+        else
+            foldl (fn (value, e) => (EApp ((EApp ((EVar (["Basis"], "value", Infer), pos), e), pos), parseValue value pos), pos))
+                (EApp ((EVar (["Basis"], "property", Infer), pos),
+                       (EPrim (Prim.String (Prim.Normal, Substring.string (#2 (Substring.splitl Char.isSpace befor)))), pos)), pos)
+                (String.tokens Char.isSpace (Substring.string (Substring.slice (after, 1, NONE))))
+    end
+
+fun parseStyle s pos =
+    case String.tokens (fn ch => ch = #";") s of
+        [] => (EVar (["Basis"], "noStyle", Infer), pos)
+      | props =>
+        foldl (fn (s, e) => (EApp ((EApp ((EVar (["Basis"], "oneProperty", Infer), pos), e), pos), parseProperty s pos), pos))
+                (EVar (["Basis"], "noStyle", Infer), pos) props
+
+fun applyWindow loc e window =
+    let
+        val (pb, ob) = getOpt (window, ((EVar (["Basis"], "sql_no_partition", Infer), dummy),
+                                        (ECApp ((EVar (["Basis"], "sql_order_by_Nil", Infer), dummy),
+                                                (CWild (KRecord (KType, dummy), dummy), dummy)),
+                                         dummy)))
+        val e' = (EVar (["Basis"], "sql_window_function", Infer), loc)
+        val e' = (EApp (e', e), loc)
+        val e' = (EApp (e', pb), loc)
+    in
+        (EApp (e', ob), loc)
+    end
+
+fun patternOut (e : exp) =
+    case #1 e of
+        EWild => (PVar "_", #2 e)
+      | EVar ([], x, Infer) =>
+        if Char.isUpper (String.sub (x, 0)) then
+            (PCon ([], x, NONE), #2 e)
+        else
+            (PVar x, #2 e)
+      | EVar (xs, x, Infer) =>
+        if Char.isUpper (String.sub (x, 0)) then
+            (PCon (xs, x, NONE), #2 e)
+        else
+            (ErrorMsg.errorAt (#2 e) "Badly capitalized constructor name in pattern";
+             (PVar "_", #2 e))
+      | EPrim p => (PPrim p, #2 e)
+      | EApp ((EVar (xs, x, Infer), _), e') =>
+        (PCon (xs, x, SOME (patternOut e')), #2 e)
+      | ERecord (xes, flex) =>
+        (PRecord (map (fn (x, e') =>
+                          let
+                              val x =
+                                  case #1 x of
+                                      CName x => x
+                                    | _ => (ErrorMsg.errorAt (#2 e) "Field name not constant in pattern";
+                                            "")
+                          in
+                              (x, patternOut e')
+                          end) xes, flex), #2 e)
+      | EAnnot (e', t) =>
+        (PAnnot (patternOut e', t), #2 e)
+      | _ => (ErrorMsg.errorAt (#2 e) "This is an expression but not a pattern.";
+              (PVar "_", #2 e))
+
+%%
+%header (functor UrwebLrValsFn(structure Token : TOKEN))
+
+%term
+   EOF
+ | STRING of string | INT of Int64.int | FLOAT of Real64.real | CHAR of char
+ | SYMBOL of string | CSYMBOL of string
+ | LPAREN | RPAREN | LBRACK | RBRACK | LBRACE | RBRACE
+ | EQ | COMMA | COLON | DCOLON | DCOLONWILD | TCOLON | TCOLONWILD | DOT | HASH | UNDER | UNDERUNDER | BAR
+ | PLUS | MINUS | DIVIDE | DOTDOTDOT | MOD | AT
+ | CON | LTYPE | VAL | REC | AND | FUN | MAP | UNIT | KUNIT | CLASS | FFI
+ | DATATYPE | OF
+ | TYPE | NAME
+ | ARROW | LARROW | DARROW | STAR | SEMI | KARROW | DKARROW | BANG
+ | FN | PLUSPLUS | MINUSMINUS | MINUSMINUSMINUS | DOLLAR | TWIDDLE | CARET
+ | LET | IN
+ | STRUCTURE | SIGNATURE | STRUCT | SIG | END | FUNCTOR | WHERE | SQL | SELECT1
+ | INCLUDE | OPEN | CONSTRAINT | CONSTRAINTS | EXPORT | TABLE | SEQUENCE | VIEW
+ | COOKIE | STYLE | TASK | POLICY
+ | CASE | IF | THEN | ELSE | ANDALSO | ORELSE
+
+ | XML_BEGIN of string | XML_END | XML_BEGIN_END of string
+ | NOTAGS of string
+ | BEGIN_TAG of string | END_TAG of string
+
+ | SELECT | DISTINCT | FROM | AS | CWHERE | GROUP | ORDER | BY | HAVING
+ | UNION | INTERSECT | EXCEPT
+ | LIMIT | OFFSET | ALL
+ | TRUE | FALSE | CAND | OR | NOT
+ | COUNT | AVG | SUM | MIN | MAX | RANK | PARTITION | OVER
+ | ASC | DESC | RANDOM
+ | INSERT | INTO | VALUES | UPDATE | SET | DELETE | NULL | IS | COALESCE | LIKE
+ | CURRENT_TIMESTAMP
+ | NE | LT | LE | GT | GE
+ | CCONSTRAINT | UNIQUE | CHECK | PRIMARY | FOREIGN | KEY | ON | NO | ACTION | RESTRICT | CASCADE | REFERENCES
+ | JOIN | INNER | CROSS | OUTER | LEFT | RIGHT | FULL
+ | CIF | CTHEN | CELSE
+ | FWDAPP | REVAPP | COMPOSE | ANDTHEN
+ | BACKTICK_PATH of string
+
+%nonterm
+   file of decl list
+ | decls of decl list
+ | decl of decl list
+ | vali of string * con option * exp
+ | valis of (string * con option * exp) list
+ | copt of con option
+
+ | dargs of string list
+ | barOpt of unit
+ | dcons of (string * con option) list
+ | dtype of string * string list * (string * con option) list
+ | dtypes of (string * string list * (string * con option) list) list
+ | dcon of string * con option
+
+ | pkopt of exp
+ | pk of exp
+ | commaOpt of unit
+
+ | cst of exp
+ | csts of exp
+ | cstopt of exp
+
+ | ckl of (string * kind option) list
+
+ | pmode of prop_kind * exp
+ | pkind of prop_kind
+ | prule of exp
+ | pmodes of (prop_kind * exp) list
+
+ | sgn of sgn
+ | sgntm of sgn
+ | sgi of sgn_item
+ | sgis of sgn_item list
+
+ | str of str
+
+ | kind of kind
+ | ktuple of kind list
+ | kcolon of explicitness
+ | kopt of kind option
+
+ | path of string list * string
+ | cpath of string list * string
+ | spath of str
+ | mpath of string list
+
+ | cexp of con
+ | cexpO of con option
+ | capps of con
+ | cterm of con
+ | ctuple of con list
+ | ctuplev of con list
+ | ident of con
+ | idents of con list
+ | rcon of (con * con) list
+ | rconn of (con * con) list
+ | rcone of (con * con) list
+ | cargs of con * kind -> con * kind
+ | cargl of con * kind -> con * kind
+ | cargl2 of con * kind -> con * kind
+ | carg of con * kind -> con * kind
+ | cargp of con * kind -> con * kind
+
+ | eexp of exp
+ | eapps of exp
+ | eterm of exp
+ | etuple of exp list
+ | rexp of (con * exp) list * bool
+ | rpath of con
+ | xml of exp
+ | xmlOne of exp
+ | xmlOpt of exp
+ | tag of (string * exp) * exp option * exp option * exp option * exp
+ | tagHead of string * exp
+ | bind of pat * con option * exp
+ | edecl of edecl
+ | edecls of edecl list
+
+ | earg of exp * con -> exp * con
+ | eargp of exp * con -> exp * con
+ | earga of exp * con -> exp * con
+ | eargs of exp * con -> exp * con
+ | eargl of exp * con -> exp * con
+ | eargl2 of bool * (exp * con -> exp * con)
+
+ | branch of pat * exp
+ | branchs of (pat * exp) list
+ | pat of pat
+ | patS of pat
+ | pterm of pat
+ | rpat of (string * pat) list * bool
+ | ptuple of pat list
+
+ | attrs of exp option * exp option * exp option * exp option * exp option * (string * string * exp) list * (con * exp) list
+ | attr of attr
+ | attrv of exp
+
+ | query of exp
+ | query1 of exp
+ | dopt of exp
+ | tables of con list * exp
+ | fitem of con list * exp
+ | tname of con
+ | tnameW of con * con
+ | tnames of (con * con) * (con * con) list
+ | tnames' of (con * con) * (con * con) list
+ | table of con * exp
+ | table' of con * exp
+ | tident of con
+ | fident of con
+ | seli of select_item
+ | selis of select_item list
+ | select of select
+ | sqlexp of exp
+ | window of (exp * exp) option
+ | pbopt of exp
+ | wopt of exp
+ | groupi of group_item
+ | groupis of group_item list
+ | gopt of group_item list option
+ | hopt of exp
+ | obopt of exp
+ | obitem of exp * exp
+ | obexps of exp
+ | popt of unit
+ | diropt of exp
+ | lopt of exp
+ | ofopt of exp
+ | sqlint of exp
+ | sqlagg of string
+ | fname of exp
+
+ | texp of exp
+ | fields of con list
+ | sqlexps of exp list
+ | fsets of (con * exp) list
+ | enterDml of unit
+ | leaveDml of unit
+
+ | ffi_mode of ffi_mode
+ | ffi_modes of ffi_mode list
+
+
+%verbose                                (* print summary of errors *)
+%pos int                                (* positions *)
+%start file
+%pure
+%eop EOF
+%noshift EOF
+
+%name Urweb
+
+%right KARROW
+%nonassoc DKARROW
+%right SEMI
+%nonassoc LARROW
+%nonassoc IF THEN ELSE
+%nonassoc DARROW
+%left ANDALSO
+%left ORELSE
+%nonassoc COLON
+%nonassoc DCOLON TCOLON DCOLONWILD TCOLONWILD
+%left UNION INTERSECT EXCEPT ALL
+%right COMMA
+%right JOIN INNER CROSS OUTER LEFT RIGHT FULL
+%right OR
+%right CAND
+%nonassoc EQ NE LT LE GT GE IS LIKE
+%right ARROW
+
+%left REVAPP
+%right FWDAPP
+%left BACKTICK_PATH
+%right COMPOSE ANDTHEN
+
+%right CARET PLUSPLUS
+%left MINUSMINUS MINUSMINUSMINUS
+%left PLUS MINUS
+%left STAR DIVIDE MOD
+%left NOT
+%nonassoc TWIDDLE
+%nonassoc DOLLAR
+%left DOT
+%nonassoc LBRACE RBRACE
+
+%%
+
+file   : decls                          (decls)
+       | SIG sgis                       ([(DSgn ("?", (SgnConst sgis, s (SIGleft, sgisright))),
+                                           s (SIGleft, sgisright))])
+
+decls  :                                ([])
+       | decl decls                     (decl @ decls)
+
+decl   : CON SYMBOL cargl2 kopt EQ cexp (let
+                                             val loc = s (CONleft, cexpright)
+
+                                             val k = Option.getOpt (kopt, (KWild, loc))
+                                             val (c, k) = cargl2 (cexp, k)
+                                         in
+                                             [(DCon (SYMBOL, SOME k, c), loc)]
+                                         end)
+       | LTYPE SYMBOL cargl2 EQ cexp    (let
+                                             val loc = s (LTYPEleft, cexpright)
+
+                                             val k = (KWild, loc)
+                                             val (c, k) = cargl2 (cexp, k)
+                                         in
+                                             [(DCon (SYMBOL, SOME k, c), loc)]
+                                         end)
+       | DATATYPE dtypes                ([(DDatatype dtypes, s (DATATYPEleft, dtypesright))])
+       | DATATYPE SYMBOL dargs EQ DATATYPE CSYMBOL DOT path
+                (case dargs of
+                     [] => [(DDatatypeImp (SYMBOL, CSYMBOL :: #1 path, #2 path), s (DATATYPEleft, pathright))]
+                   | _ => raise Fail "Arguments specified for imported datatype")
+       | VAL pat eargl2 copt EQ eexp    (let
+                                            fun justVar (p : pat) =
+                                                case #1 p of
+                                                    PVar x => SOME x
+                                                  | PAnnot (p', _) => justVar p'
+                                                  | _ => NONE
+
+                                            val loc = s (VALleft, eexpright)
+                                        in
+                                            case justVar pat of
+                                                SOME x =>
+                                                let
+                                                    val t = Option.getOpt (copt, (CWild (KType, loc), loc))
+                                                    val (e, t) = #2 eargl2 (eexp, t)
+                                                    val pat =
+                                                        case #1 t of
+                                                            CWild _ => pat
+                                                          | _ => (PAnnot (pat, t), loc)
+                                                in
+                                                    [(DVal (pat, e), loc)]
+                                                end
+                                              | NONE =>
+                                                let
+                                                    val pat =
+                                                        case copt of
+                                                            SOME t => (PAnnot (pat, t), loc)
+                                                          | _ => pat
+                                                in
+                                                    (if #1 eargl2 then
+                                                         ErrorMsg.errorAt loc "Additional arguments not allowed after pattern"
+                                                     else
+                                                         ());
+                                                    [(DVal (pat, eexp), loc)]
+                                                end
+                                        end)
+       | VAL REC valis                  ([(DValRec valis, s (VALleft, valisright))])
+       | FUN valis                      ([(DValRec valis, s (FUNleft, valisright))])
+
+       | SIGNATURE CSYMBOL EQ sgn       ([(DSgn (CSYMBOL, sgn), s (SIGNATUREleft, sgnright))])
+       | STRUCTURE CSYMBOL EQ str       ([(DStr (CSYMBOL, NONE, NONE, str, false), s (STRUCTUREleft, strright))])
+       | STRUCTURE CSYMBOL COLON sgn EQ str ([(DStr (CSYMBOL, SOME sgn, NONE, str, false), s (STRUCTUREleft, strright))])
+       | FUNCTOR CSYMBOL LPAREN CSYMBOL COLON sgn RPAREN EQ str
+                                        ([(DStr (CSYMBOL1, NONE, NONE,
+                                                 (StrFun (CSYMBOL2, sgn1, NONE, str), s (FUNCTORleft, strright)), false),
+                                           s (FUNCTORleft, strright))])
+       | FUNCTOR CSYMBOL LPAREN CSYMBOL COLON sgn RPAREN COLON sgn EQ str
+                                        ([(DStr (CSYMBOL1, NONE, NONE,
+                                                 (StrFun (CSYMBOL2, sgn1, SOME sgn2, str), s (FUNCTORleft, strright)), false),
+                                           s (FUNCTORleft, strright))])
+       | OPEN mpath                     (case mpath of
+                                             [] => raise Fail "Impossible mpath parse [1]"
+                                           | m :: ms => [(DOpen (m, ms), s (OPENleft, mpathright))])
+       | OPEN mpath LPAREN str RPAREN   (let
+                                             val loc = s (OPENleft, RPARENright)
+
+                                             val m = case mpath of
+                                                         [] => raise Fail "Impossible mpath parse [4]"
+                                                       | m :: ms =>
+                                                         foldl (fn (m, str) => (StrProj (str, m), loc))
+                                                         (StrVar m, loc) ms
+                                         in
+                                             [(DStr ("anon", NONE, NONE, (StrApp (m, str), loc), false), loc),
+                                              (DOpen ("anon", []), loc)]
+                                         end)
+       | OPEN CONSTRAINTS mpath         (case mpath of
+                                             [] => raise Fail "Impossible mpath parse [3]"
+                                           | m :: ms => [(DOpenConstraints (m, ms), s (OPENleft, mpathright))])
+       | CONSTRAINT cterm TWIDDLE cterm ([(DConstraint (cterm1, cterm2), s (CONSTRAINTleft, ctermright))])
+       | EXPORT spath                   ([(DExport spath, s (EXPORTleft, spathright))])
+       | TABLE SYMBOL COLON cterm pkopt commaOpt cstopt([(DTable (SYMBOL, entable cterm, pkopt, cstopt),
+                                                 s (TABLEleft, cstoptright))])
+       | SEQUENCE SYMBOL                ([(DSequence SYMBOL, s (SEQUENCEleft, SYMBOLright))])
+       | VIEW SYMBOL EQ query           ([(DView (SYMBOL, query),
+                                           s (VIEWleft, queryright))])
+       | VIEW SYMBOL EQ LBRACE eexp RBRACE ([(DView (SYMBOL, eexp),
+                                           s (VIEWleft, RBRACEright))])
+       | COOKIE SYMBOL COLON cexp       ([(DCookie (SYMBOL, cexp), s (COOKIEleft, cexpright))])
+       | STYLE SYMBOL                   ([(DStyle SYMBOL, s (STYLEleft, SYMBOLright))])
+       | TASK eapps EQ eexp             ([(DTask (eapps, eexp), s (TASKleft, eexpright))])
+       | POLICY eexp                    ([(DPolicy eexp, s (POLICYleft, eexpright))])
+       | FFI SYMBOL ffi_modes COLON cexp([(DFfi (SYMBOL, ffi_modes, cexp), s (FFIleft, cexpright))])
+
+dtype  : SYMBOL dargs EQ barOpt dcons   (SYMBOL, dargs, dcons)
+
+dtypes : dtype                          ([dtype])
+       | dtype AND dtypes               (dtype :: dtypes)
+
+kopt   :                                (NONE)
+       | DCOLON kind                    (SOME kind)
+       | DCOLONWILD                     (SOME (KWild, s (DCOLONWILDleft, DCOLONWILDright)))
+
+dargs  :                                ([])
+       | SYMBOL dargs                   (SYMBOL :: dargs)
+
+barOpt :                                ()
+       | BAR                            ()
+
+dcons  : dcon                           ([dcon])
+       | dcon BAR dcons                 (dcon :: dcons)
+
+dcon   : CSYMBOL                        (CSYMBOL, NONE)
+       | CSYMBOL OF cexp                (CSYMBOL, SOME cexp)
+
+vali   : SYMBOL eargl2 copt EQ eexp     (let
+                                             val loc = s (SYMBOLleft, eexpright)
+                                             val t = Option.getOpt (copt, (CWild (KType, loc), loc))
+
+                                             val (e, t) = #2 eargl2 (eexp, t)
+                                         in
+                                             (SYMBOL, SOME t, e)
+                                         end)
+
+copt   :                                (NONE)
+       | COLON cexp                     (SOME cexp)
+
+cstopt :                                (EVar (["Basis"], "no_constraint", Infer), dummy)
+       | csts                           (csts)
+
+csts   : CCONSTRAINT tname cst          (let
+                                             val loc = s (CCONSTRAINTleft, cstright)
+
+                                             val e = (EVar (["Basis"], "one_constraint", Infer), loc)
+                                             val e = (ECApp (e, tname), loc)
+                                         in
+                                             (EApp (e, cst), loc)
+                                         end)
+       | csts COMMA csts                (let
+                                             val loc = s (csts1left, csts2right)
+
+                                             val e = (EVar (["Basis"], "join_constraints", Infer), loc)
+                                             val e = (EApp (e, csts1), loc)
+                                         in
+                                             (EApp (e, csts2), loc)
+                                         end)
+       | LBRACE LBRACE eexp RBRACE RBRACE (eexp)
+
+cst    : UNIQUE tnames                  (let
+                                             val loc = s (UNIQUEleft, tnamesright)
+
+                                             val e = (EVar (["Basis"], "unique", Infer), loc)
+                                             val e = (ECApp (e, #1 (#1 tnames)), loc)
+                                             val e = (ECApp (e, (CRecord (#2 tnames), loc)), loc)
+                                         in
+                                             e
+                                         end)
+
+       | CHECK sqlexp                   (let
+                                             val loc = s (CHECKleft, sqlexpright)
+                                         in
+                                             (EApp ((EVar (["Basis"], "check", Infer), loc),
+                                                    sqlexp), loc)
+                                         end)
+
+       | FOREIGN KEY tnames REFERENCES texp LPAREN tnames' RPAREN pmodes
+                                        (let
+                                             val loc = s (FOREIGNleft, pmodesright)
+
+                                             val mat = ListPair.foldrEq
+                                                       (fn ((nm1, _), (nm2, _), mat) =>
+                                                           let
+                                                               val e = (EVar (["Basis"], "mat_cons", Infer), loc)
+                                                               val e = (ECApp (e, nm1), loc)
+                                                               val e = (ECApp (e, nm2), loc)
+                                                           in
+                                                               (EApp (e, mat), loc)
+                                                           end)
+                                                       (EVar (["Basis"], "mat_nil", Infer), loc)
+                                                       (#1 tnames :: #2 tnames, #1 tnames' :: #2 tnames')
+                                                 handle ListPair.UnequalLengths =>
+                                                        (ErrorMsg.errorAt loc ("Unequal foreign key list lengths ("
+                                                                               ^ Int.toString (1 + length (#2 tnames))
+                                                                               ^ " vs. "
+                                                                               ^ Int.toString (1 + length (#2 tnames'))
+                                                                               ^ ")");
+                                                         (EVar (["Basis"], "mat_nil", Infer), loc))
+
+                                             fun findMode mode =
+                                                 let
+                                                     fun findMode' pmodes =
+                                                         case pmodes of
+                                                             [] => (EVar (["Basis"], "no_action", Infer), loc)
+                                                           | (mode', rule) :: pmodes' =>
+                                                             if mode' = mode then
+                                                                 (if List.exists (fn (mode', _) => mode' = mode)
+                                                                                 pmodes' then
+                                                                      ErrorMsg.errorAt loc "Duplicate propagation rule"
+                                                                  else
+                                                                      ();
+                                                                  rule)
+                                                             else
+                                                                 findMode' pmodes'
+                                                 in
+                                                     findMode' pmodes
+                                                 end
+
+                                             val e = (EVar (["Basis"], "foreign_key", Infer), loc)
+                                             val e = (EApp (e, mat), loc)
+                                             val e = (EApp (e, texp), loc)
+                                         in
+                                             (EApp (e, (ERecord ([((CName "OnDelete", loc),
+                                                                   findMode Delete),
+                                                                  ((CName "OnUpdate", loc),
+                                                                   findMode Update)], false), loc)), loc)
+                                         end)
+
+       | LBRACE eexp RBRACE             (eexp)
+
+tnameW : tname                          (let
+                                             val loc = s (tnameleft, tnameright)
+                                         in
+                                             (tname, (CWild (KType, loc), loc))
+                                         end)
+
+tnames : tnameW                         (tnameW, [])
+       | LPAREN tnames' RPAREN          (tnames')
+
+tnames': tnameW                         (tnameW, [])
+       | tnameW COMMA tnames'           (#1 tnames', tnameW :: #2 tnames')
+
+pmode  : ON pkind prule                 (pkind, prule)
+
+pkind  : DELETE                         (Delete)
+       | UPDATE                         (Update)
+
+prule  : NO ACTION                      (EVar (["Basis"], "no_action", Infer), s (NOleft, ACTIONright))
+       | RESTRICT                       (EVar (["Basis"], "restrict", Infer), s (RESTRICTleft, RESTRICTright))
+       | CASCADE                        (EVar (["Basis"], "cascade", Infer), s (CASCADEleft, CASCADEright))
+       | SET NULL                       (EVar (["Basis"], "set_null", Infer), s (SETleft, NULLright))
+
+pmodes :                                ([])
+       | pmode pmodes                   (pmode :: pmodes)
+
+commaOpt:                               ()
+        | COMMA                         ()
+
+pk     : LBRACE LBRACE eexp RBRACE RBRACE (eexp)
+       | tnames                         (let
+                                             val loc = s (tnamesleft, tnamesright)
+
+                                             val e = (EVar (["Basis"], "primary_key", TypesOnly), loc)
+                                             val e = (ECApp (e, #1 (#1 tnames)), loc)
+                                             val e = (ECApp (e, (CRecord (#2 tnames), loc)), loc)
+                                             val e = (EDisjointApp e, loc)
+                                             val e = (EDisjointApp e, loc)
+
+                                             val witness = map (fn (c, _) =>
+                                                                   (c, (EWild, loc)))
+                                                           (#1 tnames :: #2 tnames)
+                                             val witness = (ERecord (witness, false), loc)
+                                         in
+                                             (EApp (e, witness), loc)
+                                         end)
+
+pkopt  :                                (EVar (["Basis"], "no_primary_key", Infer), dummy)
+       | PRIMARY KEY pk                 (pk)
+
+valis  : vali                           ([vali])
+       | vali AND valis                 (vali :: valis)
+
+sgn    : sgntm                          (sgntm)
+       | FUNCTOR LPAREN CSYMBOL COLON sgn RPAREN COLON sgn
+                                        (SgnFun (CSYMBOL, sgn1, sgn2), s (FUNCTORleft, sgn2right))
+
+sgntm  : SIG sgis END                   (SgnConst sgis, s (SIGleft, ENDright))
+       | mpath                          (case mpath of
+                                             [] => raise Fail "Impossible mpath parse [2]"
+                                           | [x] => SgnVar x
+                                           | m :: ms => SgnProj (m,
+                                                                 List.take (ms, length ms - 1),
+                                                                 List.nth (ms, length ms - 1)),
+                                         s (mpathleft, mpathright))
+       | sgntm WHERE CON path EQ cexp   (SgnWhere (sgntm, #1 path, #2 path, cexp), s (sgntmleft, cexpright))
+       | sgntm WHERE LTYPE path EQ cexp (SgnWhere (sgntm, #1 path, #2 path, cexp), s (sgntmleft, cexpright))
+       | LPAREN sgn RPAREN              (sgn)
+
+cexpO  :                                (NONE)
+       | EQ cexp                        (SOME cexp)
+
+sgi    : LTYPE SYMBOL                   ((SgiConAbs (SYMBOL, (KType, s (LTYPEleft, SYMBOLright))),
+                                          s (LTYPEleft, SYMBOLright)))
+       | CON SYMBOL cargl2 kopt cexpO   (let
+                                             val loc = s (CONleft, cexpOright)
+
+                                             val k = Option.getOpt (kopt, (KWild, loc))
+                                         in
+                                             case cexpO of
+                                                 NONE => (SgiConAbs (SYMBOL, k), loc)
+                                               | SOME cexp =>
+                                                 let
+                                                     val (c, k) = cargl2 (cexp, k)
+                                                 in
+                                                     (SgiCon (SYMBOL, SOME k, c), loc)
+                                                 end
+                                         end)
+       | LTYPE SYMBOL cargl2 cexpO      (let
+                                             val loc = s (LTYPEleft, cexpOright)
+
+                                             val k = (KWild, loc)
+                                         in
+                                             case cexpO of
+                                                 NONE => (SgiConAbs (SYMBOL, k), loc)
+                                               | SOME cexp =>
+                                                 let
+                                                     val (c, k) = cargl2 (cexp, k)
+                                                 in
+                                                     (SgiCon (SYMBOL, SOME k, c), loc)
+                                                 end
+                                         end)
+       | DATATYPE dtypes                ((SgiDatatype dtypes, s (DATATYPEleft, dtypesright)))
+       | DATATYPE SYMBOL dargs EQ DATATYPE CSYMBOL DOT path
+                (case dargs of
+                     [] => (SgiDatatypeImp (SYMBOL, CSYMBOL :: #1 path, #2 path), s (DATATYPEleft, pathright))
+                   | _ => raise Fail "Arguments specified for imported datatype")
+       | VAL SYMBOL COLON cexp          ((SgiVal (SYMBOL, cexp), s (VALleft, cexpright)))
+
+       | STRUCTURE CSYMBOL COLON sgn    ((SgiStr (CSYMBOL, sgn), s (STRUCTUREleft, sgnright)))
+       | SIGNATURE CSYMBOL EQ sgn       ((SgiSgn (CSYMBOL, sgn), s (SIGNATUREleft, sgnright)))
+       | FUNCTOR CSYMBOL LPAREN CSYMBOL COLON sgn RPAREN COLON sgn
+                                        ((SgiStr (CSYMBOL1,
+                                                  (SgnFun (CSYMBOL2, sgn1, sgn2), s (FUNCTORleft, sgn2right))),
+                                          s (FUNCTORleft, sgn2right)))
+       | INCLUDE sgn                    ((SgiInclude sgn, s (INCLUDEleft, sgnright)))
+       | CONSTRAINT cterm TWIDDLE cterm ((SgiConstraint (cterm1, cterm2), s (CONSTRAINTleft, ctermright)))
+       | TABLE SYMBOL COLON cterm pkopt commaOpt cstopt (let
+                                                    val loc = s (TABLEleft, ctermright)
+                                                in
+                                                    (SgiTable (SYMBOL, entable cterm, pkopt, cstopt), loc)
+                                                end)
+       | SEQUENCE SYMBOL                (let
+                                             val loc = s (SEQUENCEleft, SYMBOLright)
+                                             val t = (CVar (["Basis"], "sql_sequence"), loc)
+                                         in
+                                             (SgiVal (SYMBOL, t), loc)
+                                         end)
+       | VIEW SYMBOL COLON cexp         (let
+                                             val loc = s (VIEWleft, cexpright)
+                                             val t = (CVar (["Basis"], "sql_view"), loc)
+                                             val t = (CApp (t, entable cexp), loc)
+                                         in
+                                             (SgiVal (SYMBOL, t), loc)
+                                         end)
+       | CLASS SYMBOL                   (let
+                                             val loc = s (CLASSleft, SYMBOLright)
+                                             val k = (KArrow ((KType, loc), (KType, loc)), loc)
+                                         in
+                                             (SgiClassAbs (SYMBOL, k), loc)
+                                         end)
+       | CLASS SYMBOL DCOLON kind       (let
+                                             val loc = s (CLASSleft, kindright)
+                                         in
+                                             (SgiClassAbs (SYMBOL, kind), loc)
+                                         end)
+       | CLASS SYMBOL EQ cexp           (let
+                                             val loc = s (CLASSleft, cexpright)
+                                         in
+                                             (SgiClass (SYMBOL, (KWild, loc), cexp), loc)
+                                         end)
+       | CLASS SYMBOL DCOLON kind EQ cexp (let
+                                               val loc = s (CLASSleft, cexpright)
+                                           in
+                                               (SgiClass (SYMBOL, kind, cexp), loc)
+                                           end)
+       | CLASS SYMBOL SYMBOL EQ cexp    (let
+                                             val loc = s (CLASSleft, cexpright)
+                                             val k = (KWild, loc)
+                                             val c = (CAbs (SYMBOL2, SOME k, cexp), loc)
+                                         in
+                                             (SgiClass (SYMBOL1, k, c), s (CLASSleft, cexpright))
+                                         end)
+       | CLASS SYMBOL LPAREN SYMBOL DCOLON kind RPAREN EQ cexp    (let
+                                             val loc = s (CLASSleft, cexpright)
+                                             val c = (CAbs (SYMBOL2, SOME kind, cexp), loc)
+                                         in
+                                             (SgiClass (SYMBOL1, kind, c), s (CLASSleft, cexpright))
+                                         end)
+       | COOKIE SYMBOL COLON cexp       (let
+                                             val loc = s (COOKIEleft, cexpright)
+                                             val t = (CApp ((CVar (["Basis"], "http_cookie"), loc),
+                                                            entable cexp), loc)
+                                         in
+                                             (SgiVal (SYMBOL, t), loc)
+                                         end)
+       | STYLE SYMBOL                   (let
+                                             val loc = s (STYLEleft, SYMBOLright)
+                                             val t = (CVar (["Basis"], "css_class"), loc)
+                                         in
+                                             (SgiVal (SYMBOL, t), loc)
+                                         end)
+
+sgis   :                                ([])
+       | sgi sgis                       (sgi :: sgis)
+
+str    : STRUCT decls END               (StrConst decls, s (STRUCTleft, ENDright))
+       | spath                          (spath)
+       | FUNCTOR LPAREN CSYMBOL COLON sgn RPAREN DARROW str
+                                        (StrFun (CSYMBOL, sgn, NONE, str), s (FUNCTORleft, strright))
+       | FUNCTOR LPAREN CSYMBOL COLON sgn RPAREN COLON sgn DARROW str
+                                        (StrFun (CSYMBOL, sgn1, SOME sgn2, str), s (FUNCTORleft, strright))
+       | spath LPAREN str RPAREN        (StrApp (spath, str), s (spathleft, RPARENright))
+
+spath  : CSYMBOL                        (StrVar CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+       | spath DOT CSYMBOL              (StrProj (spath, CSYMBOL), s (spathleft, CSYMBOLright))
+
+kind   : TYPE                           (KType, s (TYPEleft, TYPEright))
+       | NAME                           (KName, s (NAMEleft, NAMEright))
+       | LBRACE kind RBRACE             (KRecord kind, s (LBRACEleft, RBRACEright))
+       | kind ARROW kind                (KArrow (kind1, kind2), s (kind1left, kind2right))
+       | LPAREN kind RPAREN             (#1 kind, s (LPARENleft, RPARENright))
+       | KUNIT                          (KUnit, s (KUNITleft, KUNITright))
+       | UNDERUNDER                     (KWild, s (UNDERUNDERleft, UNDERUNDERright))
+       | LPAREN ktuple RPAREN           (KTuple ktuple, s (LPARENleft, RPARENright))
+       | CSYMBOL                        (KVar CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+       | CSYMBOL KARROW kind            (KFun (CSYMBOL, kind), s (CSYMBOLleft, kindright))
+
+ktuple : kind STAR kind                 ([kind1, kind2])
+       | kind STAR ktuple               (kind :: ktuple)
+
+capps  : cterm                          (cterm)
+       | capps cterm                    (CApp (capps, cterm), s (cappsleft, ctermright))
+
+cexp   : capps                          (capps)
+       | cexp ARROW cexp                (TFun (cexp1, cexp2), s (cexp1left, cexp2right))
+       | SYMBOL kcolon kind ARROW cexp  (TCFun (kcolon, SYMBOL, kind, cexp), s (SYMBOLleft, cexpright))
+       | CSYMBOL KARROW cexp            (TKFun (CSYMBOL, cexp), s (CSYMBOLleft, cexpright))
+
+       | cexp PLUSPLUS cexp             (CConcat (cexp1, cexp2), s (cexp1left, cexp1right))
+
+       | FN cargs DARROW cexp           (#1 (cargs (cexp, (KWild, s (FNleft, cexpright)))))
+       | LBRACK cexp TWIDDLE cexp RBRACK DARROW cexp (TDisjoint (cexp1, cexp2, cexp3), s (LBRACKleft, cexp3right))
+       | CSYMBOL DKARROW cexp           (CKAbs (CSYMBOL, cexp), s (CSYMBOLleft, cexpright))
+
+       | LPAREN cexp RPAREN DCOLON kind (CAnnot (cexp, kind), s (LPARENleft, kindright))
+
+       | UNDER DCOLON kind              (CWild kind, s (UNDERleft, UNDERright))
+       | ctuple                         (let
+                                             val loc = s (ctupleleft, ctupleright)
+                                         in
+                                             (TRecord (CRecord (ListUtil.mapi (fn (i, c) =>
+                                                                                  ((CName (Int.toString (i + 1)), loc),
+                                                                                   c)) ctuple),
+                                                       loc), loc)
+                                         end)
+
+kcolon : DCOLON                         (Explicit)
+       | TCOLON                         (Implicit)
+
+cargs  : carg                           (carg)
+       | cargl                          (cargl)
+
+cargl  : cargp cargp                    (cargp1 o cargp2)
+       | cargp cargl                    (cargp o cargl)
+
+cargl2 :                                (fn x => x)
+       | cargp cargl2                   (cargp o cargl2)
+
+carg   : SYMBOL DCOLON kind             (fn (c, k) =>
+                                            let
+                                                val loc = s (SYMBOLleft, kindright)
+                                            in
+                                                ((CAbs (SYMBOL, SOME kind, c), loc),
+                                                 (KArrow (kind, k), loc))
+                                            end)
+       | UNDER DCOLON kind              (fn (c, k) =>
+                                            let
+                                                val loc = s (UNDERleft, kindright)
+                                            in
+                                                ((CAbs ("_", SOME kind, c), loc),
+                                                 (KArrow (kind, k), loc))
+                                            end)
+       | SYMBOL DCOLONWILD              (fn (c, k) =>
+                                            let
+                                                val loc = s (SYMBOLleft, DCOLONWILDright)
+                                                val kind = (KWild, loc)
+                                            in
+                                                ((CAbs (SYMBOL, NONE, c), loc),
+                                                 (KArrow (kind, k), loc))
+                                            end)
+       | UNDER DCOLONWILD               (fn (c, k) =>
+                                            let
+                                                val loc = s (UNDERleft, DCOLONWILDright)
+                                                val kind = (KWild, loc)
+                                            in
+                                                ((CAbs ("_", NONE, c), loc),
+                                                 (KArrow (kind, k), loc))
+                                            end)
+       | cargp                          (cargp)
+
+cargp  : SYMBOL                         (fn (c, k) =>
+                                            let
+                                                val loc = s (SYMBOLleft, SYMBOLright)
+                                            in
+                                                ((CAbs (SYMBOL, NONE, c), loc),
+                                                 (KArrow ((KWild, loc), k), loc))
+                                            end)
+       | UNDER                          (fn (c, k) =>
+                                            let
+                                                val loc = s (UNDERleft, UNDERright)
+                                            in
+                                                ((CAbs ("_", NONE, c), loc),
+                                                 (KArrow ((KWild, loc), k), loc))
+                                            end)
+       | LPAREN SYMBOL kopt ckl RPAREN (fn (c, k) =>
+                                              let
+                                                  val loc = s (LPARENleft, RPARENright)
+                                                  val ckl = (SYMBOL, kopt) :: ckl
+                                                  val ckl = map (fn (x, ko) => (x, case ko of
+                                                                                       NONE => (KWild, loc)
+                                                                                     | SOME k => k)) ckl
+                                              in
+                                                  case ckl of
+                                                      [(x, k')] => ((CAbs (SYMBOL, SOME k', c), loc),
+                                                                    (KArrow (k', k), loc))
+                                                    | _ =>
+                                                      let
+                                                          val k' = (KTuple (map #2 ckl), loc)
+
+                                                          val c = foldr (fn ((x, k), c) =>
+                                                                            (CAbs (x, SOME k, c), loc)) c ckl
+                                                          val v = (CVar ([], "$x"), loc)
+                                                          val c = ListUtil.foldli (fn (i, _, c) =>
+                                                                                      (CApp (c, (CProj (v, i + 1), loc)),
+                                                                                       loc)) c ckl
+                                                      in
+                                                          ((CAbs ("$x", SOME k', c), loc),
+                                                           (KArrow (k', k), loc))
+                                                      end
+                                              end)
+
+ckl    :                                ([])
+       | COMMA SYMBOL kopt ckl          ((SYMBOL, kopt) :: ckl)
+
+path   : SYMBOL                         ([], SYMBOL)
+       | CSYMBOL DOT path               (let val (ms, x) = path in (CSYMBOL :: ms, x) end)
+
+cpath  : CSYMBOL                        ([], CSYMBOL)
+       | CSYMBOL DOT cpath              (let val (ms, x) = cpath in (CSYMBOL :: ms, x) end)
+
+mpath  : CSYMBOL                        ([CSYMBOL])
+       | CSYMBOL DOT mpath              (CSYMBOL :: mpath)
+
+cterm  : LPAREN cexp RPAREN             (#1 cexp, s (LPARENleft, RPARENright))
+       | LBRACK rcon RBRACK             (CRecord rcon, s (LBRACKleft, RBRACKright))
+       | LBRACK rconn RBRACK            (CRecord rconn, s (LBRACKleft, RBRACKright))
+       | LBRACE rcone RBRACE            (TRecord (CRecord rcone, s (LBRACEleft, RBRACEright)),
+					 s (LBRACEleft, RBRACEright))
+       | DOLLAR cterm                   (TRecord cterm, s (DOLLARleft, ctermright))
+       | HASH CSYMBOL                   (CName CSYMBOL, s (HASHleft, CSYMBOLright))
+       | HASH INT                       (CName (Int64.toString INT), s (HASHleft, INTright))
+
+       | path                           (CVar path, s (pathleft, pathright))
+       | path DOT INT                   (CProj ((CVar path, s (pathleft, pathright)), Int64.toInt INT),
+                                         s (pathleft, INTright))
+       | UNDER                          (CWild (KWild, s (UNDERleft, UNDERright)), s (UNDERleft, UNDERright))
+       | MAP                            (CMap, s (MAPleft, MAPright))
+       | UNIT                           (CUnit, s (UNITleft, UNITright))
+       | LPAREN ctuplev RPAREN          (CTuple ctuplev, s (LPARENleft, RPARENright))
+
+ctuplev: cexp COMMA cexp                ([cexp1, cexp2])
+       | cexp COMMA ctuplev             (cexp :: ctuplev)
+
+ctuple : capps STAR capps               ([capps1, capps2])
+       | capps STAR ctuple              (capps :: ctuple)
+
+rcon   :                                ([])
+       | rpath EQ cexp                  ([(rpath, cexp)])
+       | rpath EQ cexp COMMA rcon       ((rpath, cexp) :: rcon)
+
+rconn  : rpath                          ([(rpath, (CUnit, s (rpathleft, rpathright)))])
+       | rpath COMMA rconn              ((rpath, (CUnit, s (rpathleft, rpathright))) :: rconn)
+
+rcone  :                                ([])
+       | rpath COLON cexp               ([(rpath, cexp)])
+       | rpath COLON cexp COMMA rcone   ((rpath, cexp) :: rcone)
+
+ident  : CSYMBOL                        (CName CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+       | INT                            (CName (Int64.toString INT), s (INTleft, INTright))
+       | SYMBOL                         (CVar ([], SYMBOL), s (SYMBOLleft, SYMBOLright))
+
+eapps  : eterm                          (eterm)
+       | eapps eterm                    (EApp (eapps, eterm), s (eappsleft, etermright))
+       | eapps LBRACK cexp RBRACK       (ECApp (eapps, cexp), s (eappsleft, RBRACKright))
+       | eapps BANG                     (EDisjointApp eapps, s (eappsleft, BANGright))
+
+eexp   : eapps                          (case #1 eapps of
+                                             EApp ((EVar ([], "CLASS", _), _), (EPrim (Prim.String (_, s)), loc)) => parseClass s loc
+                                           | EApp ((EVar ([], "STYLE", _), _), (EPrim (Prim.String (_, s)), loc)) => parseStyle s loc
+                                           | _ => eapps)
+       | FN eargs DARROW eexp           (let
+                                             val loc = s (FNleft, eexpright)
+                                         in
+                                             #1 (eargs (eexp, (CWild (KType, loc), loc)))
+                                         end)
+       | CSYMBOL DKARROW eexp           (EKAbs (CSYMBOL, eexp), s (CSYMBOLleft, eexpright))
+       | eexp COLON cexp                (EAnnot (eexp, cexp), s (eexpleft, cexpright))
+       | eexp MINUSMINUS cexp           (ECut (eexp, cexp), s (eexpleft, cexpright))
+       | eexp MINUSMINUSMINUS cexp      (ECutMulti (eexp, cexp), s (eexpleft, cexpright))
+       | CASE eexp OF barOpt branch branchs (ECase (eexp, branch :: branchs), s (CASEleft, branchsright))
+       | IF eexp THEN eexp ELSE eexp    (let
+                                             val loc = s (IFleft, eexp3right)
+                                         in
+                                             (ECase (eexp1, [((PCon (["Basis"], "True", NONE), loc), eexp2),
+                                                             ((PCon (["Basis"], "False", NONE), loc), eexp3)]), loc)
+                                         end)
+       | bind SEMI eexp                 (let
+                                             val loc = s (bindleft, eexpright)
+                                             val (p, to, e1) = bind
+                                             val e = (EVar (["Basis"], "bind", Infer), loc)
+                                             val e = (EApp (e, e1), loc)
+
+                                             val f = case #1 p of
+                                                         PVar v => (EAbs (v, to, eexp), loc)
+                                                       | _ => (EAbs ("$x", to,
+                                                                     (ECase ((EVar ([], "$x", Infer), loc),
+                                                                             [(p, eexp)]), loc)), loc)
+                                         in
+                                             (EApp (e, f), loc)
+                                         end)
+       | eexp EQ eexp                   (native_op ("eq", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp NE eexp                   (native_op ("ne", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | MINUS eterm                    (native_unop ("neg", eterm, s (MINUSleft, etermright)))
+       | eexp PLUS eexp                 (native_op ("plus", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp MINUS eexp                (native_op ("minus", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eapps STAR eexp                (native_op ("times", eapps, eexp, s (eappsleft, eexpright)))
+       | eexp DIVIDE eexp               (native_op ("divide", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp MOD eexp                  (native_op ("mod", eexp1, eexp2, s (eexp1left, eexp2right)))
+
+       | eexp LT eexp                   (native_op ("lt", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp LE eexp                   (native_op ("le", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp GT eexp                   (native_op ("gt", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp GE eexp                   (native_op ("ge", eexp1, eexp2, s (eexp1left, eexp2right)))
+
+       | eexp FWDAPP eexp               (EApp (eexp1, eexp2), s (eexp1left, eexp2right))
+       | eexp REVAPP eexp               (EApp (eexp2, eexp1), s (eexp1left, eexp2right))
+       | eexp COMPOSE eexp              (top_binop ("compose", eexp1, eexp2, s (eexp1left, eexp2right)))
+       | eexp ANDTHEN eexp              (top_binop ("compose", eexp2, eexp1, s (eexp1left, eexp2right)))
+       | eexp BACKTICK_PATH eexp        (let
+                                                val path = String.tokens (fn ch => ch = #".") BACKTICK_PATH
+                                                val pathModules = List.take (path, (length path -1))
+                                                val pathOp = List.last path
+
+                                                val e = (EVar (pathModules, pathOp, Infer)
+                                                        , s (BACKTICK_PATHleft, BACKTICK_PATHright))
+                                                val e = (EApp (e, eexp1), s (eexp1left, BACKTICK_PATHright))
+                                        in
+                                                (EApp (e, eexp2), s (eexp1left, eexp2right))
+                                        end)
+
+       | eexp ANDALSO eexp              (let
+                                             val loc = s (eexp1left, eexp2right)
+                                         in
+                                             (ECase (eexp1, [((PCon (["Basis"], "True", NONE), loc),
+                                                              eexp2),
+                                                             ((PCon (["Basis"], "False", NONE), loc),
+                                                              (EVar (["Basis"], "False", Infer), loc))]), loc)
+                                         end)
+       | eexp ORELSE eexp               (let
+                                             val loc = s (eexp1left, eexp2right)
+                                         in
+                                             (ECase (eexp1, [((PCon (["Basis"], "True", NONE), loc),
+                                                              (EVar (["Basis"], "True", Infer), loc)),
+                                                             ((PCon (["Basis"], "False", NONE), loc),
+                                                              eexp2)]), loc)
+                                         end)
+
+       | eexp PLUSPLUS eexp             (EConcat (eexp1, eexp2), s (eexp1left, eexp2right))
+
+       | eexp CARET eexp                (native_op ("strcat", eexp1, eexp2, s (eexp1left, eexp2right)))
+
+       | eapps DCOLON eexp              (let
+                                             val loc = s (eappsleft, eexpright)
+                                         in
+                                             (EApp ((EVar (["Basis"], "Cons", Infer), loc),
+                                                    (ERecord ([((CName "1", loc),
+                                                                eapps),
+                                                               ((CName "2", loc),
+                                                                eexp)], false), loc)), loc)
+                                         end)
+
+bind   : eapps LARROW eapps             (patternOut eapps1, NONE, eapps2)
+       | eapps                          (let
+                                             val loc = s (eappsleft, eappsright)
+                                         in
+                                             ((PVar "_", loc), SOME (TRecord (CRecord [], loc), loc), eapps)
+                                         end)
+
+eargs  : earg                           (earg)
+       | eargl                          (eargl)
+
+eargl  : eargp eargp                    (eargp1 o eargp2)
+       | eargp eargl                    (eargp o eargl)
+
+eargl2 :                                (false, fn x => x)
+       | eargp eargl2                   (true, eargp o #2 eargl2)
+
+earg   : patS                           (fn (e, t) =>
+                                            let
+                                                val loc = s (patSleft, patSright)
+                                                val pt = patType loc patS
+
+                                                val e' = case #1 patS of
+                                                             PVar x => (EAbs (x, NONE, e), loc)
+                                                           | PAnnot ((PVar x, _), t) => (EAbs (x, SOME t, e), loc)
+                                                           | _ => (EAbs ("$x", SOME pt,
+                                                                         (ECase ((EVar ([], "$x", DontInfer),
+                                                                                  loc),
+                                                                                 [(patS, e)]), loc)), loc)
+                                            in
+                                                (e', (TFun (pt, t), loc))
+                                            end)
+       | earga                          (earga)
+
+eargp  : pterm                          (fn (e, t) =>
+                                            let
+                                                val loc = s (ptermleft, ptermright)
+                                                val pt = patType loc pterm
+
+                                                val e' = case #1 pterm of
+                                                             PVar x => (EAbs (x, NONE, e), loc)
+                                                           | PAnnot ((PVar x, _), t) => (EAbs (x, SOME t, e), loc)
+                                                           | _ => (EAbs ("$x", SOME pt,
+                                                                         (ECase ((EVar ([], "$x", DontInfer),
+                                                                                  loc),
+                                                                                 [(pterm, e)]), loc)), loc)
+                                            in
+                                                (e', (TFun (pt, t), loc))
+                                            end)
+       | earga                          (earga)
+
+earga  : LBRACK SYMBOL RBRACK            (fn (e, t) =>
+                                             let
+                                                 val loc = s (LBRACKleft, RBRACKright)
+                                                 val kind = (KWild, loc)
+                                             in
+                                                 ((ECAbs (Implicit, SYMBOL, kind, e), loc),
+                                                  (TCFun (Implicit, SYMBOL, kind, t), loc))
+                                             end)
+       | LBRACK SYMBOL DCOLONWILD RBRACK (fn (e, t) =>
+                                             let
+                                                 val loc = s (LBRACKleft, RBRACKright)
+                                                 val kind = (KWild, loc)
+                                             in
+                                                 ((ECAbs (Explicit, SYMBOL, kind, e), loc),
+                                                  (TCFun (Explicit, SYMBOL, kind, t), loc))
+                                             end)
+       | LBRACK SYMBOL kcolon kind RBRACK(fn (e, t) =>
+                                             let
+                                                 val loc = s (LBRACKleft, RBRACKright)
+                                             in
+                                                 ((ECAbs (kcolon, SYMBOL, kind, e), loc),
+                                                  (TCFun (kcolon, SYMBOL, kind, t), loc))
+                                             end)
+       | LBRACK SYMBOL TCOLONWILD RBRACK (fn (e, t) =>
+                                             let
+                                                 val loc = s (LBRACKleft, RBRACKright)
+                                                 val kind = (KWild, loc)
+                                             in
+                                                 ((ECAbs (Implicit, SYMBOL, kind, e), loc),
+                                                  (TCFun (Implicit, SYMBOL, kind, t), loc))
+                                             end)
+       | LBRACK cexp TWIDDLE cexp RBRACK(fn (e, t) =>
+                                            let
+                                                val loc = s (LBRACKleft, RBRACKright)
+                                            in
+                                                ((EDisjoint (cexp1, cexp2, e), loc),
+                                                 (TDisjoint (cexp1, cexp2, t), loc))
+                                            end)
+       | LBRACK CSYMBOL RBRACK          (fn (e, t) =>
+                                               let
+                                                   val loc = s (CSYMBOLleft, CSYMBOLright)
+                                               in
+                                                   ((EKAbs (CSYMBOL, e), loc),
+                                                    (TKFun (CSYMBOL, t), loc))
+                                               end)
+
+eterm  : LPAREN eexp RPAREN             (#1 eexp, s (LPARENleft, RPARENright))
+       | LPAREN etuple RPAREN           (let
+                                             val loc = s (LPARENleft, RPARENright)
+                                         in
+                                             (ERecord (ListUtil.mapi (fn (i, e) =>
+                                                                         ((CName (Int.toString (i + 1)), loc),
+                                                                          e)) etuple, false), loc)
+                                         end)
+
+       | path                           (EVar (#1 path, #2 path, Infer), s (pathleft, pathright))
+       | cpath                          (EVar (#1 cpath, #2 cpath, Infer), s (cpathleft, cpathright))
+       | AT path                        (EVar (#1 path, #2 path, TypesOnly), s (ATleft, pathright))
+       | AT AT path                     (EVar (#1 path, #2 path, DontInfer), s (AT1left, pathright))
+       | AT cpath                       (EVar (#1 cpath, #2 cpath, TypesOnly), s (ATleft, cpathright))
+       | AT AT cpath                    (EVar (#1 cpath, #2 cpath, DontInfer), s (AT1left, cpathright))
+       | LBRACE rexp RBRACE             (ERecord rexp, s (LBRACEleft, RBRACEright))
+       | LBRACE RBRACE                  (ERecord ([], false), s (LBRACEleft, RBRACEright))
+       | UNIT                           (ERecord ([], false), s (UNITleft, UNITright))
+
+       | INT                            (EPrim (Prim.Int INT), s (INTleft, INTright))
+       | FLOAT                          (EPrim (Prim.Float FLOAT), s (FLOATleft, FLOATright))
+       | STRING                         (EPrim (Prim.String (Prim.Normal, STRING)), s (STRINGleft, STRINGright))
+       | CHAR                           (EPrim (Prim.Char CHAR), s (CHARleft, CHARright))
+
+       | path DOT idents                (let
+                                             val loc = s (pathleft, identsright)
+                                         in
+                                             foldl (fn (ident, e) =>
+                                                       (EField (e, ident), loc))
+                                                   (EVar (#1 path, #2 path, Infer), s (pathleft, pathright)) idents
+                                         end)
+       | LPAREN eexp RPAREN DOT idents  (let
+                                             val loc = s (LPARENleft, identsright)
+                                         in
+                                             foldl (fn (ident, e) =>
+                                                       (EField (e, ident), loc))
+                                                   eexp idents
+                                         end)
+       | AT path DOT idents             (let
+                                             val loc = s (ATleft, identsright)
+                                         in
+                                             foldl (fn (ident, e) =>
+                                                       (EField (e, ident), loc))
+                                                   (EVar (#1 path, #2 path, TypesOnly), s (pathleft, pathright)) idents
+                                         end)
+       | AT AT path DOT idents          (let
+                                             val loc = s (AT1left, identsright)
+                                         in
+                                             foldl (fn (ident, e) =>
+                                                       (EField (e, ident), loc))
+                                                   (EVar (#1 path, #2 path, DontInfer), s (pathleft, pathright)) idents
+                                         end)
+
+       | XML_BEGIN xml XML_END          (let
+                                             val loc = s (XML_BEGINleft, XML_ENDright)
+                                         in
+                                             if XML_BEGIN = "xml" then
+                                                 ()
+                                             else
+                                                 ErrorMsg.errorAt loc "Initial XML tag pair aren't both tagged \"xml\".";
+                                             xml
+                                         end)
+       | XML_BEGIN XML_END              (let
+                                             val loc = s (XML_BEGINleft, XML_ENDright)
+                                         in
+                                             if XML_BEGIN = "xml" then
+                                                 ()
+                                             else
+                                                 ErrorMsg.errorAt loc "Initial XML tag pair aren't both tagged \"xml\".";
+                                             (EApp ((EVar (["Basis"], "cdata", Infer), loc),
+                                                    (EPrim (Prim.String (Prim.Html, "")), loc)),
+                                              loc)
+                                         end)
+       | XML_BEGIN_END                  (let
+                                             val loc = s (XML_BEGIN_ENDleft, XML_BEGIN_ENDright)
+                                         in
+                                             if XML_BEGIN_END = "xml" then
+                                                 ()
+                                             else
+                                                 ErrorMsg.errorAt loc "Initial XML tag pair aren't both tagged \"xml\".";
+                                             (EApp ((EVar (["Basis"], "cdata", Infer), loc),
+                                                    (EPrim (Prim.String (Prim.Html, "")), loc)),
+                                              loc)
+                                         end)
+
+       | LPAREN query RPAREN            (query)
+       | LPAREN CWHERE sqlexp RPAREN    (sqlexp)
+       | LPAREN SQL sqlexp RPAREN       (sqlexp)
+       | LPAREN FROM tables RPAREN      (#2 tables)
+       | LPAREN SELECT1 query1 RPAREN   (query1)
+
+       | LPAREN INSERT INTO texp LPAREN fields RPAREN VALUES LPAREN sqlexps RPAREN RPAREN
+                                        (let
+                                             val loc = s (LPAREN1left, RPAREN3right)
+
+                                             val e = (EVar (["Basis"], "insert", Infer), loc)
+                                             val e = (EApp (e, texp), loc)
+                                         in
+                                             if length fields <> length sqlexps then
+                                                 ErrorMsg.errorAt loc ("Length mismatch in INSERT field specification ("
+                                                                       ^ Int.toString (length fields)
+                                                                       ^ " vs. " ^ Int.toString (length sqlexps) ^ ")")
+                                             else
+                                                 ();
+                                             (EApp (e, (ERecord (ListPair.zip (fields, sqlexps), false), loc)), loc)
+                                         end)
+       | LPAREN enterDml UPDATE texp SET fsets CWHERE sqlexp leaveDml RPAREN
+                                        (let
+                                             val loc = s (LPARENleft, RPARENright)
+
+                                             val e = (EVar (["Basis"], "update", Infer), loc)
+                                             val e = (ECApp (e, (CWild (KRecord (KType, loc), loc), loc)), loc)
+                                             val e = (EApp (e, (ERecord (fsets, false), loc)), loc)
+                                             val e = (EApp (e, texp), loc)
+                                         in
+                                             (EApp (e, sqlexp), loc)
+                                         end)
+       | LPAREN enterDml DELETE FROM texp CWHERE sqlexp leaveDml RPAREN
+                                        (let
+                                             val loc = s (LPARENleft, RPARENright)
+
+                                             val e = (EVar (["Basis"], "delete", Infer), loc)
+                                             val e = (EApp (e, texp), loc)
+                                         in
+                                             (EApp (e, sqlexp), loc)
+                                         end)
+
+       | UNDER                          (EWild, s (UNDERleft, UNDERright))
+
+       | LET edecls IN eexp END         (ELet (edecls, eexp), s (LETleft, ENDright))
+       | LET eexp WHERE edecls END      (ELet (edecls, eexp), s (LETleft, ENDright))
+
+       | LBRACK RBRACK                  (EVar (["Basis"], "Nil", Infer), s (LBRACKleft, RBRACKright))
+
+edecls :                                ([])
+       | edecl edecls                   (edecl :: edecls)
+
+edecl  : VAL pat EQ eexp                ((EDVal (pat, eexp), s (VALleft, eexpright)))
+       | VAL REC valis                  ((EDValRec valis, s (VALleft, valisright)))
+       | FUN valis                      ((EDValRec valis, s (FUNleft, valisright)))
+
+enterDml :                              (inDml := true)
+leaveDml :                              (inDml := false)
+
+texp   : SYMBOL                         (EVar ([], SYMBOL, Infer), s (SYMBOLleft, SYMBOLright))
+       | LBRACE LBRACE eexp RBRACE RBRACE (eexp)
+
+fields : fident                         ([fident])
+       | fident COMMA fields            (fident :: fields)
+
+sqlexps: sqlexp                         ([sqlexp])
+       | sqlexp COMMA sqlexps           (sqlexp :: sqlexps)
+
+fsets  : fident EQ sqlexp               ([(fident, sqlexp)])
+       | fident EQ sqlexp COMMA fsets   ((fident, sqlexp) :: fsets)
+
+idents : ident                          ([ident])
+       | ident DOT idents               (ident :: idents)
+
+etuple : eexp COMMA eexp                ([eexp1, eexp2])
+       | eexp COMMA etuple              (eexp :: etuple)
+
+branch : pat DARROW eexp                (pat, eexp)
+
+branchs:                                ([])
+       | BAR branch branchs             (branch :: branchs)
+
+patS   : pterm                          (pterm)
+       | pterm DCOLON patS              (let
+                                             val loc = s (ptermleft, patSright)
+                                         in
+                                             (PCon (["Basis"], "Cons", SOME (PRecord ([("1", pterm),
+                                                                                       ("2", patS)], false), loc)),
+                                              loc)
+                                         end)
+       | patS COLON cexp                (PAnnot (patS, cexp), s (patSleft, cexpright))
+
+pat    : patS                           (patS)
+       | cpath pterm                    (PCon (#1 cpath, #2 cpath, SOME pterm), s (cpathleft, ptermright))
+
+pterm  : SYMBOL                         (PVar SYMBOL, s (SYMBOLleft, SYMBOLright))
+       | cpath                          (PCon (#1 cpath, #2 cpath, NONE), s (cpathleft, cpathright))
+       | UNDER                          (PVar "_", s (UNDERleft, UNDERright))
+       | INT                            (PPrim (Prim.Int INT), s (INTleft, INTright))
+       | MINUS INT                      (PPrim (Prim.Int (~INT)), s (MINUSleft, INTright))
+       | STRING                         (PPrim (Prim.String (Prim.Normal, STRING)), s (STRINGleft, STRINGright))
+       | CHAR                           (PPrim (Prim.Char CHAR), s (CHARleft, CHARright))
+       | LPAREN pat RPAREN              (pat)
+       | LBRACE RBRACE                  (PRecord ([], false), s (LBRACEleft, RBRACEright))
+       | UNIT                           (PRecord ([], false), s (UNITleft, UNITright))
+       | LBRACE rpat RBRACE             (PRecord rpat, s (LBRACEleft, RBRACEright))
+       | LPAREN ptuple RPAREN           (PRecord (ListUtil.mapi (fn (i, p) => (Int.toString (i + 1), p)) ptuple,
+                                                  false),
+                                         s (LPARENleft, RPARENright))
+       | LBRACK RBRACK                  (PCon (["Basis"], "Nil", NONE), s (LBRACKleft, RBRACKright))
+
+rpat   : CSYMBOL EQ pat                 ([(CSYMBOL, pat)], false)
+       | INT EQ pat                     ([(Int64.toString INT, pat)], false)
+       | DOTDOTDOT                      ([], true)
+       | CSYMBOL EQ pat COMMA rpat      ((CSYMBOL, pat) :: #1 rpat, #2 rpat)
+       | INT EQ pat COMMA rpat          ((Int64.toString INT, pat) :: #1 rpat, #2 rpat)
+
+ptuple : pat COMMA pat                  ([pat1, pat2])
+       | pat COMMA ptuple               (pat :: ptuple)
+
+rexp   : DOTDOTDOT                      ([], true)
+       | rpath EQ eexp                  ([(rpath, eexp)], false)
+       | rpath EQ eexp COMMA rexp       ((rpath, eexp) :: #1 rexp, #2 rexp)
+
+rpath  : path                           (CVar path, s (pathleft, pathright))
+       | CSYMBOL                        (CName CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+
+xml    : xmlOne xml                     (let
+                                             val pos = s (xmlOneleft, xmlright)
+                                         in
+                                             (EApp ((EApp (
+                                                     (EVar (["Basis"], "join", Infer), pos),
+                                                  xmlOne), pos),
+                                                    xml), pos)
+                                         end)
+       | xmlOne                         (xmlOne)
+
+xmlOpt : xml                            (xml)
+       |                                (EApp ((EVar (["Basis"], "cdata", Infer), dummy),
+                                               (EPrim (Prim.String (Prim.Html, "")), dummy)),
+                                         dummy)
+
+xmlOne : NOTAGS                         (EApp ((EVar (["Basis"], "cdata", Infer), s (NOTAGSleft, NOTAGSright)),
+                                               (EPrim (Prim.String (Prim.Html, NOTAGS)), s (NOTAGSleft, NOTAGSright))),
+                                         s (NOTAGSleft, NOTAGSright))
+       | tag DIVIDE GT                  (let
+                                             val pos = s (tagleft, GTright)
+
+                                             val cdata =
+                                                 if #1 (#1 tag) = "submit" orelse #1 (#1 tag) = "dyn" then
+                                                     let
+                                                         val e = (EVar (["Basis"], "cdata", DontInfer), pos)
+                                                         val e = (ECApp (e, (CWild (KWild, pos), pos)), pos)
+                                                     in
+                                                         (ECApp (e, (CRecord [], pos)), pos)
+                                                     end
+                                                 else
+                                                     (EVar (["Basis"], "cdata", Infer), pos)
+
+                                             val cdata = (EApp (cdata,
+                                                                (EPrim (Prim.String (Prim.Html, "")), pos)),
+                                                          pos)
+                                         in
+                                             (EApp (#5 tag, cdata), pos)
+                                         end)
+
+       | tag GT xmlOpt END_TAG          (let
+                                             fun tagOut s =
+                                                 case s of
+                                                     "tabl" => "table"
+                                                   | _ => s
+
+                                             val pos = s (tagleft, GTright)
+                                             val et = tagIn END_TAG
+                                         in
+                                             if #1 (#1 tag) = et then
+                                                 if et = "form" then
+                                                     let
+                                                         val e = (EVar (["Basis"], "form", Infer), pos)
+                                                         val e = (EApp (e, case #4 tag of
+                                                                               NONE => (EVar (["Basis"], "None", Infer), pos)
+                                                                             | SOME c => (EApp ((EVar (["Basis"], "Some", Infer), pos), c), pos)), pos)
+                                                         val e = (EApp (e, case #2 tag of
+                                                                               NONE => (EVar (["Basis"], "None", Infer), pos)
+                                                                             | SOME (EPrim (Prim.String (_, s)), _) => (EApp ((EVar (["Basis"], "Some", Infer), pos), parseClass s pos), pos)
+                                                                             | SOME c => (EApp ((EVar (["Basis"], "Some", Infer), pos), c), pos)), pos)
+                                                     in
+                                                         case #3 tag of
+                                                             NONE => ()
+                                                           | SOME _ => ErrorMsg.errorAt pos "<form> does not support 'dynClass' attribute";
+                                                         (EApp (e, xmlOpt), pos)
+                                                     end
+                                                 else if et = "subform" orelse et = "subforms" then
+                                                     (EApp (#2 (#1 tag),
+                                                            xmlOpt), pos)
+                                                 else if et = "entry" then
+                                                     (EApp ((EVar (["Basis"], "entry", Infer), pos),
+                                                            xmlOpt), pos)
+                                                 else
+                                                     (EApp (#5 tag, xmlOpt), pos)
+                                             else
+                                                 (if ErrorMsg.anyErrors () then
+                                                      ()
+                                                  else
+                                                      ErrorMsg.errorAt pos ("Begin tag <"
+                                                                            ^ tagOut (#1 (#1 tag))
+                                                                            ^ "> and end tag </"
+                                                                            ^ tagOut et
+                                                                            ^ "> don't match.");
+                                                  (EWild, pos))
+                                         end)
+       | LBRACE eexp RBRACE             (eexp)
+       | LBRACE LBRACK eexp RBRACK RBRACE (let
+                                             val loc = s (LBRACEleft, RBRACEright)
+                                             val e = (EVar (["Top"], "txt", Infer), loc)
+                                         in
+                                             (EApp (e, eexp), loc)
+                                         end)
+
+tag    : tagHead attrs                  (let
+                                             val pos = s (tagHeadleft, attrsright)
+
+                                             val e = (EVar (["Basis"], "tag", Infer), pos)
+                                             val eo = case #1 attrs of
+                                                          NONE => (EVar (["Basis"], "null", Infer), pos)
+                                                        | SOME (EPrim (Prim.String (_, s)), pos) => parseClass s pos
+                                                        | SOME e => e
+                                             val e = (EApp (e, eo), pos)
+                                             val eo = case #2 attrs of
+                                                          NONE => (EVar (["Basis"], "None", Infer), pos)
+                                                        | SOME e => (EApp ((EVar (["Basis"], "Some", Infer), pos),
+                                                                           e), pos)
+                                             val e = (EApp (e, eo), pos)
+                                             val eo = case #3 attrs of
+                                                          NONE => (EVar (["Basis"], "noStyle", Infer), pos)
+                                                        | SOME (EPrim (Prim.String (_, s)), pos) => parseStyle s pos
+                                                        | SOME e => e
+                                             val e = (EApp (e, eo), pos)
+                                             val eo = case #4 attrs of
+                                                          NONE => (EVar (["Basis"], "None", Infer), pos)
+                                                        | SOME e => (EApp ((EVar (["Basis"], "Some", Infer), pos),
+                                                                           e), pos)
+                                             val e = (EApp (e, eo), pos)
+
+                                             val atts = case #6 attrs of
+                                                            [] => #7 attrs
+                                                          | data :: datas =>
+                                                            let
+                                                                fun doOne (kind, name, value) =
+                                                                    let
+                                                                        val e = (EVar (["Basis"], "data_attr", Infer), pos)
+                                                                        val e = (EApp (e, (EVar (["Basis"], kind ^ "_kind", Infer), pos)), pos)
+                                                                        val e = (EApp (e, (EPrim (Prim.String (Prim.Normal, name)), pos)), pos)
+                                                                    in
+                                                                        (EApp (e, value), pos)
+                                                                    end
+
+                                                                val datas' = foldl (fn (nv, acc) =>
+                                                                                       let
+                                                                                           val e = (EVar (["Basis"], "data_attrs", Infer), pos)
+                                                                                           val e = (EApp (e, acc), pos)
+                                                                                       in
+                                                                                           (EApp (e, doOne nv), pos)
+                                                                                       end) (doOne data) datas
+                                                            in
+                                                                ((CName "Data", pos), datas') :: #7 attrs
+                                                            end
+
+                                             val e = (EApp (e, (ERecord (atts, false), pos)), pos)
+                                             val e = (EApp (e, (EApp (#2 tagHead,
+                                                                      (ERecord ([], false), pos)), pos)), pos)
+                                         in
+                                             (tagHead, #1 attrs, #2 attrs, #5 attrs, e)
+                                         end)
+
+tagHead: BEGIN_TAG                      (let
+                                             val bt = tagIn BEGIN_TAG
+                                             val pos = s (BEGIN_TAGleft, BEGIN_TAGright)
+                                         in
+                                             (bt,
+                                              (EVar ([], bt, Infer), pos))
+                                         end)
+       | tagHead LBRACE cexp RBRACE     (#1 tagHead, (ECApp (#2 tagHead, cexp), s (tagHeadleft, RBRACEright)))
+
+attrs  :                                (NONE, NONE, NONE, NONE, NONE, [], [])
+       | attr attrs                     (let
+                                             val loc = s (attrleft, attrsright)
+                                         in
+                                             case attr of
+                                                 Class e =>
+                                                 (case #1 attrs of
+                                                      NONE => ()
+                                                    | SOME _ => ErrorMsg.errorAt loc "Multiple classes specified for tag";
+                                                  (SOME e, #2 attrs, #3 attrs, #4 attrs, #5 attrs, #6 attrs, #7 attrs))
+                                               | DynClass e =>
+                                                 (case #2 attrs of
+                                                      NONE => ()
+                                                    | SOME _ => ErrorMsg.errorAt loc "Multiple dynamic classes specified for tag";
+                                                  (#1 attrs, SOME e, #3 attrs, #4 attrs, #5 attrs, #6 attrs, #7 attrs))
+                                               | Style e =>
+                                                 (case #3 attrs of
+                                                      NONE => ()
+                                                    | SOME _ => ErrorMsg.errorAt loc "Multiple styles specified for tag";
+                                                  (#1 attrs, #2 attrs, SOME e, #4 attrs, #5 attrs, #6 attrs, #7 attrs))
+                                               | DynStyle e =>
+                                                 (case #4 attrs of
+                                                      NONE => ()
+                                                    | SOME _ => ErrorMsg.errorAt loc "Multiple dynamic classes specified for tag";
+                                                  (#1 attrs, #2 attrs, #3 attrs, SOME e, #5 attrs, #6 attrs, #7 attrs))
+                                               | Data xe =>
+                                                 (#1 attrs, #2 attrs, #3 attrs, #4 attrs, #5 attrs, xe :: #6 attrs, #7 attrs)
+                                               | Normal xe =>
+                                                 (#1 attrs, #2 attrs, #3 attrs, #4 attrs, (case #1 (#1 xe) of
+                                                                                               CName "Id" => SOME (#2 xe)
+                                                                                             | _ => #5 attrs), #6 attrs, xe :: #7 attrs)
+                                         end)
+
+attr   : SYMBOL EQ attrv                (case SYMBOL of
+					     "class" => Class attrv
+					   | "dynClass" => DynClass attrv
+                                           | "style" => Style attrv
+					   | "dynStyle" => DynStyle attrv
+					   | _ =>
+                                             if String.isPrefix "data-" SYMBOL then
+                                                 Data ("data", String.extract (SYMBOL, 5, NONE), attrv)
+                                             else if String.isPrefix "aria-" SYMBOL then
+                                                 Data ("aria", String.extract (SYMBOL, 5, NONE), attrv)
+                                             else
+                                                 let
+                                                     val sym = makeAttr SYMBOL
+                                                 in
+                                                     Normal ((CName sym, s (SYMBOLleft, SYMBOLright)),
+                                                             if (sym = "Href" orelse sym = "Src")
+                                                                andalso (case #1 attrv of
+                                                                             EPrim _ => true
+                                                                           | _ => false) then
+                                                                 let
+                                                                     val loc = s (attrvleft, attrvright)
+                                                                 in
+                                                                     (EApp ((EVar (["Basis"], "bless", Infer), loc),
+                                                                            attrv), loc)
+                                                                 end
+                                                             else if sym = "Nam"
+                                                                andalso (case #1 attrv of
+                                                                             EPrim _ => true
+                                                                           | _ => false) then
+                                                                 let
+                                                                     val loc = s (attrvleft, attrvright)
+                                                                 in
+                                                                     (EApp ((EVar (["Basis"], "blessMeta", Infer), loc),
+                                                                            attrv), loc)
+                                                                 end
+                                                             else
+                                                                 attrv)
+                                                 end)
+       | SYMBOL                         (let
+                                             val loc = s (SYMBOLleft, SYMBOLright)
+                                         in
+                                             Normal ((CName (makeAttr SYMBOL), loc),
+                                                     (EVar (["Basis"], "True", Infer), loc))
+                                         end)
+
+attrv  : INT                            (EPrim (Prim.Int INT), s (INTleft, INTright))
+       | FLOAT                          (EPrim (Prim.Float FLOAT), s (FLOATleft, FLOATright))
+       | STRING                         (EPrim (Prim.String (Prim.Normal, STRING)), s (STRINGleft, STRINGright))
+       | LBRACE eexp RBRACE             (eexp)
+
+query  : query1 obopt lopt ofopt        (let
+                                             val loc = s (query1left, query1right)
+
+                                             val re = (ERecord ([((CName "Rows", loc),
+                                                                  query1),
+                                                                 ((CName "OrderBy", loc),
+                                                                  obopt),
+                                                                 ((CName "Limit", loc),
+                                                                  lopt),
+                                                                 ((CName "Offset", loc),
+                                                                  ofopt)], false), loc)
+                                         in
+                                             (EApp ((EVar (["Basis"], "sql_query", Infer), loc), re), loc)
+                                         end)
+
+dopt   :                                (EVar (["Basis"], "False", Infer), dummy)
+       | DISTINCT                       (EVar (["Basis"], "True", Infer),
+                                         s (DISTINCTleft, DISTINCTright))
+
+query1 : SELECT dopt select FROM tables wopt gopt hopt
+                                        (let
+                                             val loc = s (SELECTleft, tablesright)
+
+                                             val (empties, sel, exps) =
+                                                 case select of
+                                                     Star => ([],
+                                                              map (fn nm =>
+                                                                      (nm, (CTuple [(CWild (KRecord (KType, loc), loc),
+                                                                                     loc),
+                                                                                    (CRecord [], loc)],
+                                                                            loc))) (#1 tables),
+                                                              [])
+                                                   | Items sis =>
+                                                     let
+                                                         val tabs = map (fn nm => (nm, Unknown)) (#1 tables)
+                                                         val (_, tabs, exps) = foldl (amend_select loc)
+                                                                                     (1, tabs, []) sis
+                                                         val empties = List.mapPartial (fn (nm, c) =>
+                                                                                           case c of
+                                                                                               Unknown => SOME nm
+                                                                                             | Selective (CRecord [], _) => SOME nm
+                                                                                             | _ => NONE) tabs
+                                                     in
+                                                         (empties,
+                                                          map (fn (nm, c) => (nm,
+                                                                              case c of
+                                                                                  Everything =>
+                                                                                  (CTuple [(CWild (KRecord (KType, loc), loc), loc),
+                                                                                           (CRecord [], loc)], loc)
+                                                                                | _ =>
+                                                                                  let
+                                                                                      val c = case c of
+                                                                                                  Selective c => c
+                                                                                                | _ => (CRecord [], loc)
+                                                                                  in
+                                                                                      (CTuple [c,
+                                                                                               (CWild (KRecord (KType, loc), loc),
+                                                                                                loc)], loc)
+                                                                                  end)) tabs,
+                                                          exps)
+                                                     end
+
+                                             val exps = map (fn (c, e) => (c, (EApp ((EVar (["Basis"], "sql_window", Infer), loc), e), loc))) exps
+
+                                             val sel = (CRecord sel, loc)
+
+                                             val grp = case gopt of
+                                                           NONE => (ECApp ((EVar (["Basis"], "sql_subset_all",
+                                                                                  Infer), loc),
+                                                                           (CWild (KRecord (KRecord (KType, loc), loc),
+                                                                                   loc), loc)), loc)
+                                                         | SOME gis =>
+                                                           let
+                                                               val tabs = map (fn nm =>
+                                                                                  (nm, (CRecord [], loc))) (#1 tables)
+                                                               val tabs = foldl (amend_group loc) tabs gis
+
+                                                               val tabs = map (fn (nm, c) =>
+                                                                                  (nm,
+                                                                                   (CTuple [c,
+                                                                                            (CWild (KRecord (KType, loc),
+                                                                                                    loc),
+                                                                                             loc)], loc))) tabs
+                                                           in
+                                                               (ECApp ((EVar (["Basis"], "sql_subset", Infer), loc),
+                                                                       (CRecord tabs, loc)), loc)
+                                                           end
+
+                                             val e = (EVar (["Basis"], "sql_query1", Infer), loc)
+                                             val e = (ECApp (e, (CRecord (map (fn nm => (nm, (CUnit, loc))) empties),
+                                                                 loc)), loc)
+                                             val re = (ERecord ([((CName "Distinct", loc),
+                                                                  dopt),
+                                                                 ((CName "From", loc),
+                                                                  #2 tables),
+                                                                 ((CName "Where", loc),
+                                                                  wopt),
+                                                                 ((CName "GroupBy", loc),
+                                                                  grp),
+                                                                 ((CName "Having", loc),
+                                                                  hopt),
+                                                                 ((CName "SelectFields", loc),
+                                                                  (ECApp ((EVar (["Basis"], "sql_subset", Infer), loc),
+                                                                          sel), loc)),
+                                                                 ((CName "SelectExps", loc),
+                                                                  (ERecord (exps, false), loc))], false), loc)
+
+                                             val e = (EApp (e, re), loc)
+                                         in
+                                             e
+                                         end)
+       | query1 UNION query1            (sql_relop ("union", false, query11, query12, s (query11left, query12right)))
+       | query1 INTERSECT query1        (sql_relop ("intersect", false, query11, query12, s (query11left, query12right)))
+       | query1 EXCEPT query1           (sql_relop ("except", false, query11, query12, s (query11left, query12right)))
+       | query1 UNION ALL query1        (sql_relop ("union", true, query11, query12, s (query11left, query12right)))
+       | query1 INTERSECT ALL query1    (sql_relop ("intersect", true, query11, query12, s (query11left, query12right)))
+       | query1 EXCEPT ALL query1       (sql_relop ("except", true, query11, query12, s (query11left, query12right)))
+       | LBRACE LBRACE LBRACE eexp RBRACE RBRACE RBRACE (eexp)
+
+tables : fitem                          (fitem)
+       | fitem COMMA tables             (let
+                                             val loc = s (fitemleft, tablesright)
+
+                                             val e = (EVar (["Basis"], "sql_from_comma", Infer), loc)
+                                             val e = (EApp (e, #2 fitem), loc)
+                                         in
+                                             (#1 fitem @ #1 tables,
+                                              (EApp (e, #2 tables), loc))
+                                         end)
+
+fitem  : table'                         ([#1 table'], #2 table')
+       | LBRACE LBRACE eexp RBRACE RBRACE (tnamesOf eexp, eexp)
+       | fitem JOIN fitem ON sqlexp     (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_inner_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem INNER JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_inner_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem CROSS JOIN fitem         (let
+                                             val loc = s (fitem1left, fitem2right)
+
+                                             val e = (EVar (["Basis"], "sql_inner_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                             val tru = sql_inject (EVar (["Basis"], "True", Infer), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, tru), loc))
+                                         end)
+       | fitem LEFT JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_left_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem LEFT OUTER JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_left_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem RIGHT JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_right_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem RIGHT OUTER JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_right_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem FULL JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_full_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | fitem FULL OUTER JOIN fitem ON sqlexp (let
+                                             val loc = s (fitem1left, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_full_join", Infer), loc)
+                                             val e = (EApp (e, #2 fitem1), loc)
+                                             val e = (EApp (e, #2 fitem2), loc)
+                                         in
+                                             (#1 fitem1 @ #1 fitem2,
+                                              (EApp (e, sqlexp), loc))
+                                         end)
+       | LPAREN query RPAREN AS tname   (let
+                                             val loc = s (LPARENleft, RPARENright)
+
+                                             val e = (EVar (["Basis"], "sql_from_query", Infer), loc)
+                                             val e = (ECApp (e, tname), loc)
+                                         in
+                                             ([tname], (EApp (e, query), loc))
+                                         end)
+       | LPAREN LBRACE LBRACE eexp RBRACE RBRACE RPAREN AS tname   (let
+                                             val loc = s (LPARENleft, RPARENright)
+
+                                             val e = (EVar (["Basis"], "sql_from_query", Infer), loc)
+                                             val e = (ECApp (e, tname), loc)
+                                         in
+                                             ([tname], (EApp (e, eexp), loc))
+                                         end)
+       | LPAREN fitem RPAREN            (fitem)
+
+tname  : CSYMBOL                        (CName CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+       | LBRACE cexp RBRACE             (cexp)
+
+table  : SYMBOL                         ((CName (capitalize SYMBOL), s (SYMBOLleft, SYMBOLright)),
+                                         (EVar ([], SYMBOL, Infer), s (SYMBOLleft, SYMBOLright)))
+       | SYMBOL AS tname                (tname, (EVar ([], SYMBOL, Infer), s (SYMBOLleft, SYMBOLright)))
+       | LBRACE LBRACE eexp RBRACE RBRACE AS tname    (tname, eexp)
+
+table' : table                          (let
+                                             val loc = s (tableleft, tableright)
+                                             val e = (EVar (["Basis"], "sql_from_table", Infer), loc)
+                                             val e = (ECApp (e, #1 table), loc)
+                                         in
+                                             (#1 table, (EApp (e, #2 table), loc))
+                                         end)
+
+tident : SYMBOL                         (CName (capitalize SYMBOL), s (SYMBOLleft, SYMBOLright))
+       | CSYMBOL                        (CName CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+       | LBRACE LBRACE cexp RBRACE RBRACE (cexp)
+
+fident : CSYMBOL                        (CName CSYMBOL, s (CSYMBOLleft, CSYMBOLright))
+       | LBRACE cexp RBRACE             (cexp)
+
+seli   : tident DOT fident              (Field (tident, fident))
+       | sqlexp                         (Exp (NONE, sqlexp))
+       | sqlexp AS fident               (Exp (SOME fident, sqlexp))
+       | tident DOT LBRACE LBRACE cexp RBRACE RBRACE (Fields (tident, cexp))
+       | tident DOT STAR                (StarFields tident)
+
+selis  : seli                           ([seli])
+       | seli COMMA selis               (seli :: selis)
+
+select : STAR                           (Star)
+       | selis                          (Items selis)
+
+sqlexp : TRUE                           (sql_inject (EVar (["Basis"], "True", Infer),
+                                                     s (TRUEleft, TRUEright)))
+       | FALSE                          (sql_inject (EVar (["Basis"], "False", Infer),
+                                                     s (FALSEleft, FALSEright)))
+
+       | INT                            (sql_inject (EPrim (Prim.Int INT),
+                                                     s (INTleft, INTright)))
+       | FLOAT                          (sql_inject (EPrim (Prim.Float FLOAT),
+                                                     s (FLOATleft, FLOATright)))
+       | STRING                         (sql_inject (EPrim (Prim.String (Prim.Normal, STRING)),
+                                                     s (STRINGleft, STRINGright)))
+       | CURRENT_TIMESTAMP              (sql_nfunc ("current_timestamp",
+                                                    s (CURRENT_TIMESTAMPleft, CURRENT_TIMESTAMPright)))
+
+       | tident DOT fident              (let
+                                             val loc = s (tidentleft, fidentright)
+                                             val e = (EVar (["Basis"], "sql_field", Infer), loc)
+                                             val e = (ECApp (e, tident), loc)
+                                         in
+                                             (ECApp (e, fident), loc)
+                                         end)
+       | CSYMBOL                         (let
+                                             val loc = s (CSYMBOLleft, CSYMBOLright)
+                                          in
+                                              if !inDml then
+                                                  let
+                                                      val e = (EVar (["Basis"], "sql_field", Infer), loc)
+                                                      val e = (ECApp (e, (CName "T", loc)), loc)
+                                                  in
+                                                      (ECApp (e, (CName CSYMBOL, loc)), loc)
+                                                  end
+                                              else
+                                                  let
+                                                      val e = (EVar (["Basis"], "sql_exp", Infer), loc)
+                                                  in
+                                                      (ECApp (e, (CName CSYMBOL, loc)), loc)
+                                                  end
+                                          end)
+
+       | LBRACE eexp RBRACE             (eexp)
+
+       | sqlexp EQ sqlexp               (sql_binary ("eq", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp NE sqlexp               (sql_binary ("ne", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp LT sqlexp               (sql_binary ("lt", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp LE sqlexp               (sql_binary ("le", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp GT sqlexp               (sql_binary ("gt", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp GE sqlexp               (sql_binary ("ge", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+
+       | sqlexp PLUS sqlexp             (sql_binary ("plus", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp MINUS sqlexp            (sql_binary ("minus", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp STAR sqlexp             (sql_binary ("times", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp DIVIDE sqlexp           (sql_binary ("div", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp MOD sqlexp              (sql_binary ("mod", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+
+       | sqlexp CAND sqlexp             (sql_binary ("and", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+       | sqlexp OR sqlexp               (sql_binary ("or", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+
+       | sqlexp LIKE sqlexp             (sql_binary ("like", sqlexp1, sqlexp2, s (sqlexp1left, sqlexp2right)))
+
+       | NOT sqlexp                     (sql_unary ("not", sqlexp, s (NOTleft, sqlexpright)))
+       | MINUS sqlexp                   (sql_unary ("neg", sqlexp, s (MINUSleft, sqlexpright)))
+
+       | sqlexp IS NULL                 (let
+                                             val loc = s (sqlexpleft, NULLright)
+                                         in
+                                             (EApp ((EVar (["Basis"], "sql_is_null", Infer), loc),
+                                                    sqlexp), loc)
+                                         end)
+
+       | CIF sqlexp CTHEN sqlexp CELSE sqlexp (let
+                                                   val loc = s (CIFleft, sqlexp3right)
+                                                   val e = (EVar (["Basis"], "sql_if_then_else", Infer), loc)
+                                               in
+                                                   (EApp ((EApp ((EApp (e, sqlexp1), loc), sqlexp2), loc), sqlexp3), loc)
+                                               end)
+
+       | LBRACE LBRACK eexp RBRACK RBRACE  (sql_inject (#1 eexp,
+                                                        s (LBRACEleft, RBRACEright)))
+       | LPAREN sqlexp RPAREN           (sqlexp)
+
+       | NULL                           (sql_inject ((EVar (["Basis"], "None", Infer),
+                                                      s (NULLleft, NULLright))))
+
+       | COUNT LPAREN STAR RPAREN window(let
+                                             val loc = s (COUNTleft, windowright)
+                                         in
+                                             case window of
+                                                 NONE => (EVar (["Basis"], "sql_count", Infer), loc)
+                                               | SOME _ => applyWindow loc (EVar (["Basis"], "sql_window_count", Infer), loc) window
+                                         end)
+       | COUNT LPAREN sqlexp RPAREN window(let
+                                               val loc = s (COUNTleft, RPARENright)
+                                               val e = (EVar (["Basis"], "sql_count_col", Infer), loc)
+                                           in
+                                               case window of
+                                                   NONE =>
+                                                   let
+                                                       val e = (EApp ((EVar (["Basis"], "sql_aggregate", Infer), loc),
+                                                                      e), loc)
+                                                   in
+                                                       (EApp (e, sqlexp), loc)
+                                                   end
+                                                 | SOME _ =>
+                                                   let
+                                                       val e = (EVar (["Basis"], "sql_count_col", Infer), loc)
+                                                       val e = (EApp ((EVar (["Basis"], "sql_window_aggregate", Infer), loc),
+                                                                      e), loc)
+                                                   in
+                                                       applyWindow loc (EApp (e, sqlexp), loc) window
+                                                   end
+                                           end)
+       | sqlagg LPAREN sqlexp RPAREN window (let
+                                                 val loc = s (sqlaggleft, RPARENright)
+
+                                                 val e = (EVar (["Basis"], "sql_" ^ sqlagg, Infer), loc)
+                                             in
+                                                 case window of
+                                                     NONE =>
+                                                     let
+                                                         val e = (EApp ((EVar (["Basis"], "sql_aggregate", Infer), loc),
+                                                                        e), loc)
+                                                     in
+                                                         (EApp (e, sqlexp), loc)
+                                                     end
+                                                   | SOME _ =>
+                                                     let
+                                                         val e = (EApp ((EVar (["Basis"], "sql_window_aggregate", Infer), loc),
+                                                                        e), loc)
+                                                     in
+                                                         applyWindow loc (EApp (e, sqlexp), loc) window
+                                                     end
+                                             end)
+       | RANK UNIT window               (let
+                                             val loc = s (RANKleft, windowright)
+                                         in
+                                             applyWindow loc (EVar (["Basis"], "sql_rank", Infer), loc) window
+                                         end)
+       | COALESCE LPAREN sqlexp COMMA sqlexp RPAREN
+                                        (let
+                                             val loc = s (COALESCEright, sqlexp2right)
+                                             val e = (EVar (["Basis"], "sql_coalesce", Infer), loc)
+                                             val e = (EApp (e, sqlexp1), loc)
+                                         in
+                                             (EApp (e, sqlexp2), loc)
+                                         end)
+       | fname LPAREN sqlexp RPAREN     (let
+                                             val loc = s (fnameleft, RPARENright)
+
+                                             val e = (EVar (["Basis"], "sql_ufunc", Infer), loc)
+                                             val e = (EApp (e, fname), loc)
+                                         in
+                                             (EApp (e, sqlexp), loc)
+                                         end)
+       | LPAREN query RPAREN            (let
+                                             val loc = s (LPARENleft, RPARENright)
+
+                                             val e = (EVar (["Basis"], "sql_subquery", Infer), loc)
+                                         in
+                                             (EApp (e, query), loc)
+                                         end)
+
+window :                                (NONE)
+       | OVER LPAREN pbopt obopt RPAREN (SOME (pbopt, obopt))
+
+pbopt  :                                ((EVar (["Basis"], "sql_no_partition", Infer), dummy))
+       | PARTITION BY sqlexp            (let
+                                             val loc = s (PARTITIONleft, sqlexpright)
+
+                                             val e = (EVar (["Basis"], "sql_partition", Infer), loc)
+                                         in
+                                             (EApp (e, sqlexp), loc)
+                                         end)
+
+fname  : SYMBOL                         (EVar (["Basis"], "sql_" ^ SYMBOL, Infer), s (SYMBOLleft, SYMBOLright))
+       | LBRACE eexp RBRACE             (eexp)
+
+wopt   :                                (sql_inject (EVar (["Basis"], "True", Infer),
+                                                     dummy))
+       | CWHERE sqlexp                  (sqlexp)
+
+groupi : tident DOT fident              (GField (tident, fident))
+       | tident DOT LBRACE LBRACE cexp RBRACE RBRACE (GFields (tident, cexp))
+
+groupis: groupi                         ([groupi])
+       | groupi COMMA groupis           (groupi :: groupis)
+
+gopt   :                                (NONE)
+       | GROUP BY groupis               (SOME groupis)
+
+hopt   :                                (sql_inject (EVar (["Basis"], "True", Infer),
+                                                     dummy))
+       | HAVING sqlexp                  (sqlexp)
+
+obopt  :                                (ECApp ((EVar (["Basis"], "sql_order_by_Nil", Infer), dummy),
+                                                (CWild (KRecord (KType, dummy), dummy), dummy)),
+                                         dummy)
+       | ORDER BY obexps                (obexps)
+       | ORDER BY LBRACE LBRACE LBRACE eexp RBRACE RBRACE RBRACE (eexp)
+
+obitem : sqlexp diropt                  (sqlexp, diropt)
+
+obexps : obitem                         (let
+                                             val loc = s (obitemleft, obitemright)
+
+                                             val e' = (ECApp ((EVar (["Basis"], "sql_order_by_Nil", Infer), loc),
+                                                              (CWild (KRecord (KType, loc), loc), loc)),
+                                                       loc)
+                                             val e = (EApp ((EVar (["Basis"], "sql_order_by_Cons", Infer), loc),
+                                                            #1 obitem), loc)
+                                             val e = (EApp (e, #2 obitem), loc)
+                                         in
+                                             (EApp (e, e'), loc)
+                                         end)
+       | obitem COMMA obexps            (let
+                                             val loc = s (obitemleft, obexpsright)
+
+                                             val e = (EApp ((EVar (["Basis"], "sql_order_by_Cons", Infer), loc),
+                                                            #1 obitem), loc)
+                                             val e = (EApp (e, #2 obitem), loc)
+                                         in
+                                             (EApp (e, obexps), loc)
+                                         end)
+       | RANDOM popt                    (EVar (["Basis"], "sql_order_by_random", Infer), s (RANDOMleft, poptright))
+
+popt   :                                ()
+       | LPAREN RPAREN                  ()
+       | UNIT                           ()
+
+diropt :                                (EVar (["Basis"], "sql_asc", Infer), dummy)
+       | ASC                            (EVar (["Basis"], "sql_asc", Infer), s (ASCleft, ASCright))
+       | DESC                           (EVar (["Basis"], "sql_desc", Infer), s (DESCleft, DESCright))
+       | LBRACE eexp RBRACE             (eexp)
+
+lopt   :                                 (EVar (["Basis"], "sql_no_limit", Infer), dummy)
+       | LIMIT ALL                       (EVar (["Basis"], "sql_no_limit", Infer), dummy)
+       | LIMIT sqlint                    (let
+                                              val loc = s (LIMITleft, sqlintright)
+                                          in
+                                              (EApp ((EVar (["Basis"], "sql_limit", Infer), loc), sqlint), loc)
+                                          end)
+
+ofopt  :                                 (EVar (["Basis"], "sql_no_offset", Infer), dummy)
+       | OFFSET sqlint                   (let
+                                              val loc = s (OFFSETleft, sqlintright)
+                                          in
+                                              (EApp ((EVar (["Basis"], "sql_offset", Infer), loc), sqlint), loc)
+                                          end)
+
+sqlint : INT                             (EPrim (Prim.Int INT), s (INTleft, INTright))
+       | LBRACE eexp RBRACE              (eexp)
+
+sqlagg : AVG                             ("avg")
+       | SUM                             ("sum")
+       | MIN                             ("min")
+       | MAX                             ("max")
+
+ffi_mode : SYMBOL                        (case SYMBOL of
+                                              "effectful" => Effectful
+                                            | "benignEffectful" => BenignEffectful
+                                            | "clientOnly" => ClientOnly
+                                            | "serverOnly" => ServerOnly
+                                            | _ => (ErrorMsg.errorAt (s (SYMBOLleft, SYMBOLright)) "Invalid FFI mode"; Effectful))
+         | SYMBOL STRING                 (case SYMBOL of
+                                              "jsFunc" => JsFunc STRING
+                                            | _ => (ErrorMsg.errorAt (s (SYMBOLleft, SYMBOLright)) "Invalid FFI mode"; Effectful))
+
+ffi_modes :                              ([])
+          | ffi_mode ffi_modes           (ffi_mode :: ffi_modes)

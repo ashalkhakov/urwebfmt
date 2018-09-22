@@ -1,0 +1,34 @@
+local
+  $(SML_LIB)/basis/basis.mlb
+  $(SML_LIB)/smlnj-lib/Util/smlnj-lib.mlb
+  $(SML_LIB)/mlyacc-lib/mlyacc-lib.mlb
+  $(SML_LIB)/smlnj-lib/PP/pp-lib.mlb
+in
+  list_util.sig
+  list_util.sml
+
+  errormsg.sig
+  errormsg.sml
+
+  print.sig
+  print.sml
+
+  prim.sig
+  prim.sml
+
+  source.sml
+
+  source_print.sig
+  source_print.sml
+
+  utf8.sig
+  utf8.sml
+  xml/entities.sml
+
+  urweb.grm.sig
+  urweb.grm.sml
+  urweb.lex.sml
+
+  parse_print.sml
+  main.sml
+end
