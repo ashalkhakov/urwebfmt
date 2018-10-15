@@ -25,7 +25,13 @@
  * POSSIBILITY OF SUCH DAMAGE.
  *)
 
+structure FppBasis = FppPrecedenceBasis (FppInitialBasis (FppPlainBasisTypes))
+structure Fpp = FinalPrettyPrinter (FppBasis)
+structure Render = FppRenderPlainText
+
 structure Prim :> PRIM = struct
+
+open FppBasis Fpp
 
 datatype string_mode = Normal | Html
 
@@ -34,16 +40,6 @@ datatype t =
        | Float of Real64.real
        | String of string_mode * string
        | Char of char
-
-open Print.PD
-open Print
-
-fun p_t t =
-    case t of
-        Int n => string (Int64.toString n)
-      | Float n => string (Real64.toString n)
-      | String (_, s) => box [string "\"", string (String.toString s), string "\""]
-      | Char ch => box [string "#\"", string (String.toString (String.str ch)), string "\""]
 
 fun int2s n =
     if Int64.compare (n, Int64.fromInt 0) = LESS then

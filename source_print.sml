@@ -27,702 +27,578 @@
 
 (* Pretty-printing Ur/Web *)
 
+structure FppBasis = FppPrecedenceBasis (FppInitialBasis (FppPlainBasisTypes))
+structure Fpp = FinalPrettyPrinter (FppBasis)
+structure Render = FppRenderPlainText
+
 structure SourcePrint :> SOURCE_PRINT = struct
 
-open Print.PD
-open Print
+open FppBasis Fpp
 
+open Prim
 open Source
+
+fun @@ (f, x) = f x
+infixr 0 @@
+
+(* if we are doing linebreaks, then it's a newline;
+ * otherwise it's just a space
+ *)
+val softNewline =
+    bind spaceWidth (fn w => ifFlat (space w) newline)
+
+fun listSep0 beg sep f ls = let
+    fun aux n f ls =
+        case ls of
+            [] => empty
+          | x :: rest =>
+            seq [if n = 0 then beg else sep, f x, aux (n+1) f rest]
+in
+    aux 0 f ls
+end
+
+fun listSep sep f ls =
+    case ls of
+        [] => empty
+      | [x] => f x
+      | x :: rest => seq [f x, sep, listSep sep f rest]
+
+fun p_t t =
+    case t of
+        Int n => text (Int64.toString n)
+      | Float n => text (Real64.toString n)
+      | String (_, s) => hsepTight [text "\"", text (String.toString s), text "\""]
+      | Char ch => hsepTight [text "#\"", text (String.toString (String.str ch)), text "\""]
 
 fun p_kind' par (k, _) =
     case k of
-        KType => string "Type"
-      | KArrow (k1, k2) => parenIf par (box [p_kind' true k1,
-                                             space,
-                                             string "->",
-                                             space,
-                                             p_kind k2])
-      | KName => string "Name"
-      | KRecord k => box [string "{", p_kind k, string "}"]
-      | KUnit => string "Unit"
-      | KWild => string "_"
-      | KTuple ks => box [string "(",
-                          p_list_sep (box [space, string "*", space]) p_kind ks,
-                          string ")"]
-
-      | KVar x => string x
-      | KFun (x, k) => box [string x,
-                            space,
-                            string "-->",
-                            space,
+        KType => text "Type"
+      | KArrow (k1, k2) => hvsep [p_kind' true k1,
+                                  text "->",
+                                  p_kind k2]
+      | KName => text "Name"
+      | KRecord k => seq [text "{", p_kind k, text "}"]
+      | KUnit => text "Unit"
+      | KWild => text "_"
+      | KTuple ks => collection (text "(") (text ")") (text "*") (List.map p_kind ks)
+      | KVar x => text x
+      | KFun (x, k) => hvsep [text x,
+                            text "-->",
                             p_kind k]
+      | KParen k => seq [text "(", p_kind k, text ")"]
 
 and p_kind k = p_kind' false k
 
 fun p_explicitness e =
     case e of
-        Explicit => string "::"
-      | Implicit => string ":::"
+        Explicit => text "::"
+      | Implicit => text ":::"
 
 fun p_con' par (c, _) =
     case c of
-        CAnnot (c, k) => box [string "(",
-                              p_con c,
-                              space,
-                              string "::",
-                              space,
-                              p_kind k,
-                              string ")"]
+        CAnnot (c, k) => hvsep [p_con c, text "::", p_kind k]
 
-      | TFun (t1, t2) => parenIf par (box [p_con' true t1,
-                                           space,
-                                           string "->",
-                                           space,
-                                           p_con t2])
-      | TCFun (e, x, k, c) => parenIf par (box [string x,
-                                                space,
-                                                p_explicitness e,
-                                                space,
-                                                p_kind k,
-                                                space,
-                                                string "->",
-                                                space,
-                                                p_con c])
-      | TRecord (CRecord xcs, _) => box [string "{",
-                                         p_list (fn (x, c) =>
-                                                    box [p_name x,
-                                                         space,
-                                                         string ":",
-                                                         space,
-                                                         p_con c]) xcs,
-                                         string "}"]
-      | TRecord c => box [string "$",
-                          p_con' true c]
-      | TDisjoint (c1, c2, c3) => parenIf par (box [string "[",
-                                                    p_con c1,
-                                                    space,
-                                                    string "~",
-                                                    space,
-                                                    p_con c2,
-                                                    string "]",
-                                                    space,
-                                                    string "=>",
-                                                    space,
-                                                    p_con c3])
+      | TFun (t1, t2) => hvsep [p_con' true t1,
+                                text "->",
+                                p_con t2]
+      | TCFun (e, x, k, c) => hvsep [text x,
+                                     p_explicitness e,
+                                     p_kind k,
+                                     text "->",
+                                     p_con c]
+      | TRecord (CRecord xcs, _) => collection
+                                        (text "{") (text "}") (text ",")
+                                        (List.map (fn (x, c) => hvsep [p_name x,
+                                                                       text ":",
+                                                                       p_con c]) xcs)
+      | TRecord c => seq [text "$", p_con' true c]
+      | TDisjoint (c1, c2, c3) => hvsep [text "[",
+                                         p_con c1,
+                                         text "~",
+                                         p_con c2,
+                                         text "]",
+                                         text "=>",
+                                         p_con c3]
 
-      | CVar (ss, s) => p_list_sep (string ".") string (ss @ [s])
-      | CApp (c1, c2) => parenIf par (box [p_con c1,
-                                           space,
-                                           p_con' true c2])
-      | CAbs (x, NONE, c) => parenIf par (box [string "fn",
-                                               space,
-                                               string x,
-                                               space,
-                                               string "=>",
-                                               space,
-                                               p_con c])
-      | CAbs (x, SOME k, c) => parenIf par (box [string "fn",
-                                                 space,
-                                                 string x,
-                                                 space,
-                                                 string "::",
-                                                 space,
-                                                 p_kind k,
-                                                 space,
-                                                 string "=>",
-                                                 space,
-                                                 p_con c])
+      | CVar (ss, s) => listSep (text ".") text (ss @ [s])
+      | CApp (c1, c2) => hvsep [p_con c1,
+                                p_con' true c2]
+      | CAbs (x, NONE, c) => hvsep [text "fn",
+                                    text x,
+                                    text "=>",
+                                    p_con c]
+      | CAbs (x, SOME k, c) => hvsep [text "fn",
+                                      text x,
+                                      text "::",
+                                      p_kind k,
+                                      text "=>",
+                                      p_con c]
 
 
-      | CName s => box [string "#", string s]
+      | CName s => seq [text "#", text s]
 
-      | CRecord xcs => box [string "[",
-                            p_list (fn (x, c) =>
-                                       box [p_con x,
-                                            space,
-                                            string "=",
-                                            space,
-                                            p_con c]) xcs,
-                            string "]"]
-      | CConcat (c1, c2) => parenIf par (box [p_con' true c1,
-                                              space,
-                                              string "++",
-                                              space,
-                                              p_con c2])
-      | CMap => string "map"
+      | CRecord xcs => collection (text "[") (text "]") (text ",")
+                                  (List.map (fn (x, c) => hvsep [p_con x,
+                                                                 text "=",
+                                                                 p_con c]) xcs)
+      | CConcat (c1, c2) => hvsep [p_con' true c1,
+                                   text "++",
+                                   p_con c2]
+      | CMap => text "map"
 
-      | CUnit => string "()"
+      | CUnit => text "()"
 
-      | CWild k => box [string "(_",
-                        space,
-                        string "::",
-                        space,
+      | CWild k => hsep [text "(_",
+                        text "::",
                         p_kind k,
-                        string ")"]
+                        text ")"]
 
-      | CTuple cs => box [string "(",
-                          p_list p_con cs,
-                          string ")"]
-      | CProj (c, n) => box [p_con c,
-                             string ".",
-                             string (Int.toString n)]
+      | CTuple cs => collection (text "(") (text ")") (text ",") (List.map p_con cs)
+      | CProj (c, n) => seq [p_con c,
+                             text ".",
+                             text (Int.toString n)]
 
-      | CKAbs (x, c) => box [string x,
-                             space,
-                             string "==>",
-                             space,
-                             p_con c]
-      | TKFun (x, c) => box [string x,
-                             space,
-                             string "-->",
-                             space,
-                             p_con c]
+      | CKAbs (x, c) => hvsep [text x,
+                               text "==>",
+                               p_con c]
+      | TKFun (x, c) => hsep [text x,
+                              text "-->",
+                              p_con c]
+      | CParen c => seq [text "(", p_con c, text ")"]
 
 and p_con c = p_con' false c
 
 and p_name (all as (c, _)) =
     case c of
-        CName s => string s
+        CName s => text s
       | _ => p_con all
 
 fun p_pat' par (p, _) =
     case p of
-        PVar s => string s
-      | PPrim p => Prim.p_t p
-      | PCon (ms, x, NONE) => p_list_sep (string ".") string (ms @ [x])
-      | PCon (ms, x, SOME p) => parenIf par (box [p_list_sep (string ".") string (ms @ [x]),
-                                                  space,
-                                                  p_pat' true p])
+        PVar s => text s
+      | PPrim p => p_t p
+      | PCon (ms, x, NONE) => listSep (text ".") text (ms @ [x])
+      | PCon (ms, x, SOME p) => hvsep [listSep (text ".") text (ms @ [x]),
+                                       p_pat' true p]
       | PRecord (xps, flex) =>
         let
-            val pps = map (fn (x, p) => box [string x, space, string "=", space, p_pat p]) xps
+            val pps = map (fn (x, p) => hsep [text x, text "=", p_pat p]) xps
         in
-            box [string "{",
-                 p_list_sep (box [string ",", space]) (fn x => x)
-                 (if flex then
-                      pps @ [string "..."]
-                  else
-                      pps),
-                 string "}"]
+            bind spaceWidth (fn w =>
+                                grouped o hvsep @@ [
+                                    text "{",
+                                    listSep (seq [text ",", space w]) (fn x => x)
+                                            (if flex then
+                                                 pps @ [text "..."]
+                                             else
+                                                 pps),
+                text "}"
+            ])
         end
 
-      | PAnnot (p, t) => box [p_pat p,
-                              space,
-                              string ":",
-                              space,
-                              p_con t]
+      | PAnnot (p, t) => hsep [p_pat p,
+                               text ":",
+                               p_con t]
+      | PCVar (exp, x, k) => hsep [text x, p_explicitness exp, p_kind k]
+      | PDisjoint (c1, c2) => hsep [p_con c1, text "~", p_con c2]
+      | PKVar k => text k
+      | PParen p => seq [text "(", p_pat p, text ")"]
 
 and p_pat x = p_pat' false x
 
 fun p_exp' par (e, _) =
     case e of
-        EAnnot (e, t) => box [string "(",
-                              p_exp e,
-                              space,
-                              string ":",
-                              space,
-                              p_con t,
-                              string ")"]
+        EAnnot (e, t) => hsep [p_exp e, text ":", p_con t]
 
-      | EPrim p => Prim.p_t p
-      | EVar (ss, s, _) => p_list_sep (string ".") string (ss @ [s])
-      | EApp (e1, e2) => parenIf par (box [p_exp e1,
-                                           space,
-                                           p_exp' true e2])
-      | EAbs (x, NONE, e) => parenIf par (box [string "fn",
-                                               space,
-                                               string x,
-                                               space,
-                                               string "=>",
-                                               space,
-                                               p_exp e])
-      | EAbs (x, SOME t, e) => parenIf par (box [string "fn",
-                                                 space,
-                                                 string x,
-                                                 space,
-                                                 string ":",
-                                                 space,
-                                                 p_con t,
-                                                 space,
-                                                 string "=>",
-                                                 space,
-                                                 p_exp e])
-      | ECApp (e, c) => parenIf par (box [p_exp e,
-                                          space,
-                                          string "[",
-                                          p_con c,
-                                          string "]"])
-      | ECAbs (exp, x, k, e) => parenIf par (box [string "fn",
-                                                  space,
-                                                  string x,
-                                                  space,
-                                                  p_explicitness exp,
-                                                  space,
-                                                  p_kind k,
-                                                  space,
-                                                  string "=>",
-                                                  space,
-                                                  p_exp e])
-      | EDisjoint (c1, c2, e) => parenIf par (box [p_con c1,
-                                                   space,
-                                                   string "~",
-                                                   space,
-                                                   p_con c2,
-                                                   space,
-                                                   string "=>",
-                                                   space,
-                                                   p_exp e])
-      | EDisjointApp e => parenIf par (box [p_exp e,
-                                            space,
-                                            string "!"])
+      | EPrim p => p_t p
 
-      | ERecord (xes, flex) => box [string "{",
-                                    p_list (fn (x, e) =>
-                                               box [p_name x,
-                                                    space,
-                                                    string "=",
-                                                    space,
-                                                    p_exp e]) xes,
-                                    if flex then
-                                        box [string ",",
-                                             space,
-                                             string "..."]
-                                    else
-                                        box [],
-                                    string "}"]
-      | EField (e, c) => box [p_exp' true e,
-                              string ".",
-                              p_con' true c]
-      | EConcat (e1, e2) => parenIf par (box [p_exp' true e1,
-                                              space,
-                                              string "++",
-                                              space,
-                                              p_exp' true e2])
-      | ECut (e, c) => parenIf par (box [p_exp' true e,
-                                         space,
-                                         string "--",
-                                         space,
-                                         p_con' true c])
-      | ECutMulti (e, c) => parenIf par (box [p_exp' true e,
-                                              space,
-                                              string "---",
-                                              space,
-                                              p_con' true c])
-      | ECase (e, pes) => parenIf par (box [string "case",
-                                            space,
-                                            p_exp e,
-                                            space,
-                                            string "of",
-                                            space,
-                                            p_list_sep (box [space, string "|", space])
-                                            (fn (p, e) => box [p_pat p,
-                                                               space,
-                                                               string "=>",
-                                                               space,
-                                                               p_exp e]) pes])
+      | EUnOp (u, e) => p_unop u e
+      | EBinOp (b, e1, e2) => p_binop b e1 e2
+      | ENil => text "[]"
 
-      | EWild => string "_"
+      | EVar (ss, s, _) => listSep (text ".") text (ss @ [s])
+      | EApp (e1, e2) => hsep [p_exp e1,
+                               p_exp' true e2]
+      | EAbs (xs, SOME t, e) => bind spaceWidth (fn w => hsep [text "fn",
+                                                               listSep (space w) p_pat xs,
+                                                               text ":",
+                                                               p_con t,
+                                                               text "=>",
+                                                               p_exp e])
+      | EAbs (xs, NONE, e) => bind spaceWidth (fn w => hsep [text "fn",
+                                                             listSep (space w) p_pat xs,
+                                                             text "=>",
+                                                             p_exp e])
+      | ECApp (e, c) => hsep [p_exp e,
+                              text "[",
+                              p_con c,
+                              text "]"]
+      | ECAbs (exp, x, k, e) => hsep [text "fn",
+                                      text x,
+                                      p_explicitness exp,
+                                      p_kind k,
+                                      text "=>",
+                                      p_exp e]
+      | EDisjoint (c1, c2, e) => hvsep [hsep [p_con c1, text "~", p_con c2, text "=>"],
+                                        p_exp e]
+      | EDisjointApp e => seq [p_exp e,
+                               text "!"]
 
-      | ELet (ds, e) => box [string "let",
-                             newline,
-                             box [p_list_sep newline p_edecl ds],
-                             newline,
-                             string "in",
-                             newline,
-                             box [p_exp e],
-                             newline,
-                             string "end"]
+      | ERecord (xes, flex) =>
+        grouped o hvsep @@ [
+            text "{",
+            listSep (text ",")
+                    (fn (x, e) =>
+                        hsep [p_name x,
+                              text "=",
+                              p_exp e]) xes,
+            if flex then
+                hsep [text ",", text "..."]
+            else
+                empty,
+            text "}"]
+      | EField (e, c) => hsep [p_exp' true e,
+                               text ".",
+                               p_con' true c]
+      | EConcat (e1, e2) => hsep [p_exp' true e1,
+                                  text "++",
+                                  p_exp' true e2]
+      | ECut (e, c) => hsep [p_exp' true e,
+                             text "--",
+                             p_con' true c]
+      | ECutMulti (e, c) => hsep [p_exp' true e,
+                                  text "---",
+                                  p_con' true c]
+      | ECase (e, pes) => bind spaceWidth (fn w => hvsep [hsep [text "case", p_exp e, text "of"],
+                                                          listSep (seq [space w, text "|", space w])
+                                                                  (fn (p, e) => hsep [p_pat p,
+                                                                                      text "=>",
+                                                                                      p_exp e]) pes])
 
-      | EKAbs (x, e) => box [string x,
-                             space,
-                             string "-->",
-                             space,
-                             p_exp e]
+      | EIf (e1, e2, e3) => bind spaceWidth (fn i =>
+                                                grouped (seq [text "if",
+                                                              space i,
+                                                              p_exp e1,
+                                                              softNewline,
+                                                              text "then",
+                                                              nest 2 (seq [softNewline, p_exp e2]),
+                                                              softNewline,
+                                                              text "else",
+                                                              nest 2 (seq [softNewline, p_exp e3])]))
+      | EWild => text "_"
+
+      | ELet (ds, e) => grouped (seq [text "let",
+                                      (* welp. sometimes incorrect! tries to conserve horizontal space. *)
+                                      nest 2 (listSep0 newline newline p_edecl ds),
+                                      newline,
+                                      text "in",
+                                      nest 2 (seq [newline, p_exp e]),
+                                      newline,
+                                      text "end"
+                                     ])
+
+      | EKAbs (x, e) => hvsep [text x,
+                               text "-->",
+                               p_exp e]
+      | EParen e => grouped o seq @@ [text "(", p_exp e, text ")"]
 
 and p_exp e = p_exp' false e
 
+and p_unop Uneg e = seq [text "-", p_exp e]
+and p_binop Borelse e1 e2 = hvsep [p_exp e1, text "||", p_exp e2]
+  | p_binop Bandalso e1 e2 = hvsep [p_exp e1, text "&&", p_exp e2]
+  | p_binop Bcaret e1 e2 =  hvsep [p_exp e1, text "^", p_exp e2]
+  | p_binop Bcons e1 e2 = hvsep [p_exp e1, text "::", p_exp e2]
+  | p_binop Beq e1 e2 = hvsep [p_exp e1, text "=", p_exp e2]
+  | p_binop Bne e1 e2 = hvsep [p_exp e1, text "<>", p_exp e2]
+  | p_binop Bplus e1 e2 = hvsep [p_exp e1, text "+", p_exp e2]
+  | p_binop Bminus e1 e2 = hvsep [p_exp e1, text "-", p_exp e2]
+  | p_binop Bmult e1 e2 = hvsep [p_exp e1, text "*", p_exp e2]
+  | p_binop Bdiv e1 e2 = hvsep [p_exp e1, text "/", p_exp e2]
+  | p_binop Bmod e1 e2 = hvsep [p_exp e1, text "%", p_exp e2]
+  | p_binop Blt e1 e2 = hvsep [p_exp e1, text "<", p_exp e2]
+  | p_binop Ble e1 e2 = hvsep [p_exp e1, text "<=", p_exp e2]
+  | p_binop Bgt e1 e2 = hvsep [p_exp e1, text ">", p_exp e2]
+  | p_binop Bge e1 e2 = hvsep [p_exp e1, text ">=", p_exp e2]
+  | p_binop Bsemi e1 e2 = hvsep [p_exp e1, text ";", p_exp e2]
+
 and p_edecl (d, _) =
   case d of
-      EDVal (p, e) => box [string "val",
-                           space,
+      EDVal (p, e) => hsep [text "val",
                            p_pat p,
-                           space,
-                           string "=",
-                           space,
+                           text "=",
                            p_exp e]
-    | EDValRec vis => box [string "val",
-                           space,
-                           string "rec",
-                           space,
-                           p_list_sep (box [newline, string "and", space]) p_vali vis]
+    | EDValRec vis => bind spaceWidth (fn w => hsep [text "val",
+                                                     text "rec",
+                                                     listSep (seq [newline, text "and", space w]) p_vali vis])
+    | EDFun f => hsep [text "fun", p_fun f]
+    | EDFunRec fs => bind spaceWidth (fn w => hsep [text "fun",
+                                                    listSep (seq [newline, text "and", space w]) p_fun fs])
 
-and p_vali (x, co, e) =
+and p_funarg p = p_pat p
+
+and p_fun (x, [], co, b) =
+    (case co of
+         NONE => hsep [text x, text "=", p_exp b]
+       | SOME t => hsep [text x, text ":", p_con t, text "=", p_exp b])
+  | p_fun (x, ps, co, b) =
+    bind spaceWidth (fn w =>
+                        case co of
+                            NONE =>
+                            hsep [text x,
+                                  listSep (space w) p_funarg ps,
+                                  text "=", p_exp b]
+                          | SOME t =>
+                            hsep [text x,
+                                  listSep (space w) p_funarg ps,
+                                  text "=", p_exp b])
+
+and p_vali (x, ps, co, e) =
+    bind spaceWidth (fn w =>
     case co of
-        NONE => box [string x,
-                     space,
-                     string "=",
-                     space,
+        NONE => hsep [text x,
+                     listSep (space w) p_pat ps,
+                     text "=",
                      p_exp e]
-      | SOME t => box [string x,
-                       space,
-                       string ":",
-                       space,
+      | SOME t => hsep [text x,
+                       listSep (space w) p_pat ps,
+                       text ":",
                        p_con t,
-                       space,
-                       string "=",
-                       space,
-                       p_exp e]
+                       text "=",
+                       p_exp e])
 
 
 fun p_datatype (x, xs, cons) =
-    box [string x,
-         p_list_sep (box []) (fn x => box [space, string x]) xs,
-         space,
-         string "=",
-         space,
-         p_list_sep (box [space, string "|", space])
-         (fn (x, NONE) => string x
-           | (x, SOME t) => box [string x, space, string "of", space, p_con t])
-         cons]
+    bind spaceWidth (fn w =>
+                        hsep [text x,
+                              listSep (space w) (fn x => text x) xs,
+                              text "=",
+                              listSep (hsep [space w, text "|", space w])
+                                      (fn (x, NONE) => text x
+                                      | (x, SOME t) => hsep [text x, text "of", p_con t])
+                                      cons])
 
 fun p_sgn_item (sgi, _) =
     case sgi of
-        SgiConAbs (x, k) => box [string "con",
-                                 space,
-                                 string x,
-                                 space,
-                                 string "::",
-                                 space,
+        SgiConAbs (x, k) => hsep [text "con",
+                                 text x,
+                                 text "::",
                                  p_kind k]
-      | SgiCon (x, NONE, c) => box [string "con",
-                                    space,
-                                    string x,
-                                    space,
-                                    string "=",
-                                    space,
+      | SgiCon (x, NONE, c) => hsep [text "con",
+                                    text x,
+                                    text "=",
                                     p_con c]
-      | SgiCon (x, SOME k, c) => box [string "con",
-                                      space,
-                                      string x,
-                                      space,
-                                      string "::",
-                                      space,
+      | SgiCon (x, SOME k, c) => hsep [text "con",
+                                      text x,
+                                      text "::",
                                       p_kind k,
-                                      space,
-                                      string "=",
-                                      space,
+                                      text "=",
                                       p_con c]
-      | SgiDatatype x => box [string "datatype",
-                              space,
-                              p_list_sep (box [space, string "and", space]) p_datatype x]
+      | SgiDatatype x => bind spaceWidth (fn w =>
+                                             hsep [text "datatype",
+                                                   listSep (seq [space w, text "and", space w]) p_datatype x])
       | SgiDatatypeImp (x, ms, x') =>
-        box [string "datatype",
-             space,
-             string x,
-             space,
-             string "=",
-             space,
-             string "datatype",
-             space,
-             p_list_sep (string ".") string (ms @ [x'])]
-      | SgiVal (x, c) => box [string "val",
-                              space,
-                              string x,
-                              space,
-                              string ":",
-                              space,
+        hsep [text "datatype",
+             text x,
+             text "=",
+             text "datatype",
+             listSep (text ".") text (ms @ [x'])]
+      | SgiVal (x, c) => hsep [text "val",
+                              text x,
+                              text ":",
                               p_con c]
-      | SgiTable (x, c, pe, ce) => box [string "table",
-                                        space,
-                                        string x,
-                                        space,
-                                        string ":",
-                                        space,
+      | SgiTable (x, c, pe, ce) => hsep [text "table",
+                                        text x,
+                                        text ":",
                                         p_con c,
-                                        space,
-                                        string "keys",
-                                        space,
+                                        text "keys",
                                         p_exp pe,
-                                        space,
-                                        string "constraints",
-                                        space,
+                                        text "constraints",
                                         p_exp ce]
-      | SgiStr (x, sgn) => box [string "structure",
-                                space,
-                                string x,
-                                space,
-                                string ":",
-                                space,
+      | SgiStr (x, sgn) => hsep [text "structure",
+                                text x,
+                                text ":",
                                 p_sgn sgn]
-      | SgiSgn (x, sgn) => box [string "signature",
-                                space,
-                                string x,
-                                space,
-                                string "=",
-                                space,
+      | SgiSgn (x, sgn) => hsep [text "signature",
+                                text x,
+                                text "=",
                                 p_sgn sgn]
-      | SgiInclude sgn => box [string "include",
-                               space,
-                               p_sgn sgn]
-      | SgiConstraint (c1, c2) => box [string "constraint",
-                                       space,
+      | SgiInclude sgn => hsep [text "include",
+                                p_sgn sgn]
+      | SgiConstraint (c1, c2) => hsep [text "constraint",
                                        p_con c1,
-                                       space,
-                                       string "~",
-                                       space,
+                                       text "~",
                                        p_con c2]
-      | SgiClassAbs (x, k) => box [string "class",
-                                   space,
-                                   string x,
-                                   space,
-                                   string "::",
-                                   space,
+      | SgiClassAbs (x, k) => hsep [text "class",
+                                   text x,
+                                   text "::",
                                    p_kind k]
-      | SgiClass (x, k, c) => box [string "class",
-                                   space,
-                                   string x,
-                                   space,
-                                   string "::",
-                                   space,
+      | SgiClass (x, k, c) => hsep [text "class",
+                                   text x,
+                                   text "::",
                                    p_kind k,
-                                   space,
-                                   string "=",
-                                   space,
+                                   text "=",
                                    p_con c]
 
 and p_sgn (sgn, _) =
     case sgn of
-        SgnConst sgis => box [string "sig",
+        SgnConst sgis => seq [text "sig",
                               newline,
-                              p_list_sep newline p_sgn_item sgis,
+                              nest 2 (listSep newline p_sgn_item sgis),
                               newline,
-                              string "end"]
-      | SgnVar x => string x
-      | SgnFun (x, sgn, sgn') => box [string "functor",
-                                      space,
-                                      string "(",
-                                      string x,
-                                      space,
-                                      string ":",
+                              text "end"]
+      | SgnVar x => text x
+      | SgnFun (x, sgn, sgn') => hsep [text "functor",
+                                      text "(",
+                                      text x,
+                                      text ":",
                                       p_sgn sgn,
-                                      string ")",
-                                      space,
-                                      string ":",
-                                      space,
+                                      text ")",
+                                      text ":",
                                       p_sgn sgn']
-      | SgnWhere (sgn, ms, x, c) => box [p_sgn sgn,
-					 space,
-					 string "where",
-					 space,
-					 string "con",
-					 space,
-					 p_list_sep (string ".")
-						    string (ms @ [x]),
-					 string x,
-					 space,
-					 string "=",
-					 space,
+      | SgnWhere (sgn, ms, x, c) => hsep [p_sgn sgn,
+					 text "where",
+					 text "con",
+					 listSep (text ".")
+						 text (ms @ [x]),
+					 text x,
+					 text "=",
 					 p_con c]
-      | SgnProj (m, ms, x) => p_list_sep (string ".") string (m :: ms @ [x])
+      | SgnProj (m, ms, x) => listSep (text ".") text (m :: ms @ [x])
 
 
 
 fun p_decl ((d, _) : decl) =
     case d of
-        DCon (x, NONE, c) => box [string "con",
-                                  space,
-                                  string x,
-                                  space,
-                                  string "=",
-                                  space,
-                                  p_con c]
-      | DCon (x, SOME k, c) => box [string "con",
-                                    space,
-                                    string x,
-                                    space,
-                                    string "::",
-                                    space,
-                                    p_kind k,
-                                    space,
-                                    string "=",
-                                    space,
-                                    p_con c]
-      | DDatatype x => box [string "datatype",
-                            space,
-                            p_list_sep (box [space, string "and", space]) p_datatype x]
+        DCon (x, NONE, c) => bind spaceWidth (fn w => seq [hsep [text "con", text x, text "="], space w, p_con c])
+      | DCon (x, SOME k, c) => bind spaceWidth (fn w => seq [hsep [text "con", text x, text "::", p_kind k, text "="], space w, p_con c])
+      | DDatatype x => bind spaceWidth (fn w => seq [hsep [text "datatype"], space w,
+                                                     listSep (seq [newline, text "and", space w]) p_datatype x])
       | DDatatypeImp (x, ms, x') =>
-        box [string "datatype",
-             space,
-             string x,
-             space,
-             string "=",
-             space,
-             string "datatype",
-             space,
-             p_list_sep (string ".") string (ms @ [x'])]
-      | DVal (p, e) => box [string "val",
-                            space,
-                            p_pat p,
-                            space,
-                            string "=",
-                            space,
-                            p_exp e]
-      | DValRec vis => box [string "val",
-                            space,
-                            string "rec",
-                            space,
-                            p_list_sep (box [newline, string "and", space]) p_vali vis]
+        seq [hsep [text "datatype", text x, text "=", text "datatype"],
+             listSep (text ".") text (ms @ [x'])]
+      | DVal (p, e) => hsep [text "val", p_pat p, text "=", hvsep [p_exp e]]
+      | DValRec vis => bind spaceWidth (fn w => hsep [text "val", text "rec", listSep (seq [newline, text "and", space w]) p_vali vis])
+      | DFun f => hsep [text "fun", p_fun f]
+      | DFunRec fs => bind spaceWidth (fn w => hsep [text "fun",
+                                                     listSep (seq [newline, text "and", space w]) p_fun fs])
 
-      | DSgn (x, sgn) => box [string "signature",
-                              space,
-                              string x,
-                              space,
-                              string "=",
-                              space,
-                              p_sgn sgn]
-      | DStr (x, NONE, _, str, _) => box [string "structure",
-                                          space,
-                                          string x,
-                                          space,
-                                          string "=",
-                                          space,
+      | DSgn (x, sgn) => hsep [text "signature", text x, text "=", p_sgn sgn]
+      | DStr (x, NONE, _, str, _) => hsep [text "structure",
+                                          text x,
+                                          text "=",
                                           p_str str]
-      | DStr (x, SOME sgn, _, str, _) => box [string "structure",
-                                              space,
-                                              string x,
-                                              space,
-                                              string ":",
-                                              space,
+      | DStr (x, SOME sgn, _, str, _) => hsep [text "structure",
+                                              text x,
+                                              text ":",
                                               p_sgn sgn,
-                                              space,
-                                              string "=",
-                                              space,
+                                              text "=",
                                               p_str str]
-      | DFfiStr (x, sgn, _) => box [string "extern",
-                                    space,
-                                    string "structure",
-                                    space,
-                                    string x,
-                                    space,
-                                    string ":",
-                                    space,
+      | DFfiStr (x, sgn, _) => hsep [text "extern",
+                                    text "structure",
+                                    text x,
+                                    text ":",
                                     p_sgn sgn]
-      | DOpen (m, ms) => box [string "open",
-                              space,
-                              p_list_sep (string ".") string (m :: ms)]
-      | DConstraint (c1, c2) => box [string "constraint",
-                                     space,
+      | DOpen (m, ms) => hsep [text "open",
+                              listSep (text ".") text (m :: ms)]
+      | DConstraint (c1, c2) => hsep [text "constraint",
                                      p_con c1,
-                                     space,
-                                     string "~",
-                                     space,
+                                     text "~",
                                      p_con c2]
-      | DOpenConstraints (m, ms) => box [string "open",
-                                         space,
-                                         string "constraints",
-                                         space,
-                                         p_list_sep (string ".") string (m :: ms)]
+      | DOpenConstraints (m, ms) => hsep [text "open",
+                                         text "constraints",
+                                         listSep (text ".") text (m :: ms)]
 
-      | DExport str => box [string "export",
-                            space,
+      | DExport str => hsep [text "export",
                             p_str str]
-      | DTable (x, c, pe, ce) => box [string "table",
-                                      space,
-                                      string x,
-                                      space,
-                                      string ":",
-                                      space,
+      | DTable (x, c, pe, ce) => hsep [text "table",
+                                      text x,
+                                      text ":",
                                       p_con c,
-                                      space,
-                                      string "keys",
-                                      space,
+                                      text "keys",
                                       p_exp pe,
-                                      space,
-                                      string "constraints",
-                                      space,
+                                      text "constraints",
                                       p_exp ce]
-      | DSequence x => box [string "sequence",
-                            space,
-                            string x]
-      | DView (x, e) => box [string "view",
-                             space,
-                             string x,
-                             space,
-                             string "=",
-                             space,
-                             p_exp e]
+      | DSequence x => hsep [text "sequence", text x]
+      | DView (x, e) => hsep [text "view",
+                              text x,
+                              text "=",
+                              p_exp e]
 
-      | DDatabase s => box [string "database",
-                            space,
-                            string s]
+      | DDatabase s => hsep [text "database",
+                            text s]
 
-      | DCookie (x, c) => box [string "cookie",
-                               space,
-                               string x,
-                               space,
-                               string ":",
-                               space,
-                               p_con c]
-      | DStyle x => box [string "style",
-                         space,
-                         string x]
-      | DTask (e1, e2) => box [string "task",
-                               space,
-                               p_exp e1,
-                               space,
-                               string "=",
-                               space,
-                               p_exp e2]
-      | DPolicy e1 => box [string "policy",
-                           space,
-                           p_exp e1]
-      | DOnError _ => string "ONERROR"
-      | DFfi _ => string "FFI"
+      | DCookie (x, c) => hsep [text "cookie",
+                                text x,
+                                text ":",
+                                p_con c]
+      | DStyle x => hsep [text "style", text x]
+      | DTask (e1, e2) => hsep [text "task",
+                                p_exp e1,
+                                text "=",
+                                p_exp e2]
+      | DPolicy e1 => hsep [text "policy",
+                            p_exp e1]
+      | DOnError _ => text "ONERROR"
+      | DFfi _ => text "FFI"
 
 and p_str (str, _) =
     case str of
-        StrConst ds => box [string "struct",
+        StrConst ds => seq [text "struct",
                             newline,
-                            p_list_sep newline p_decl ds,
+                            nest 2 (listSep newline p_decl ds),
                             newline,
-                            string "end"]
-      | StrVar x => string x
-      | StrProj (str, x) => box [p_str str,
-                                 string ".",
-                                 string x]
-      | StrFun (x, sgn, NONE, str) => box [string "functor",
-                                           space,
-                                           string "(",
-                                           string x,
-                                           space,
-                                           string ":",
+                            text "end"]
+      | StrVar x => text x
+      | StrProj (str, x) => seq [p_str str,
+                                 text ".",
+                                 text x]
+      | StrFun (x, sgn, NONE, str) => hsep [text "functor",
+                                           text "(",
+                                           text x,
+                                           text ":",
                                            p_sgn sgn,
-                                           string ")",
-                                           space,
-                                           string "=>",
-                                           space,
+                                           text ")",
+                                           text "=>",
+                                           newline,
                                            p_str str]
-      | StrFun (x, sgn, SOME sgn', str) => box [string "functor",
-                                                space,
-                                                string "(",
-                                                string x,
-                                                space,
-                                                string ":",
+      | StrFun (x, sgn, SOME sgn', str) => hsep [text "functor",
+                                                text "(",
+                                                text x,
+                                                text ":",
                                                 p_sgn sgn,
-                                                string ")",
-                                                space,
-                                                string ":",
-                                                space,
+                                                text ")",
+                                                text ":",
                                                 p_sgn sgn',
-                                                space,
-                                                string "=>",
-                                                space,
+                                                text "=>",
+                                                newline,
                                                 p_str str]
-      | StrApp (str1, str2) => box [p_str str1,
-                                    string "(",
+      | StrApp (str1, str2) => hsep [p_str str1,
+                                    text "(",
                                     p_str str2,
-                                    string ")"]
+                                    text ")"]
 
-val p_file = p_list_sep newline p_decl
+val p_file = listSep newline p_decl
+
+local
+
+    val initialEnv =
+        {maxWidth = 80,
+         maxRibbon = 60,
+         layout = FppTypes.BREAK,
+         failure = FppTypes.CANT_FAIL,
+         nesting = 0,
+         formatting = (),
+         formatAnn = fn _ => ()}
+
+in
+
+fun execPP (m : unit m) =
+    #output @@ m emptyPrecEnv initialEnv {curLine = [], maxWidthSeen = 0}
+
+end
+
+fun renderToStream (strm, v) =
+    Render.render strm (execPP v)
 
 end

@@ -4,5 +4,11 @@ urweb.grm.sig urweb.grm.sml: urweb.grm
 urweb.lex.sml: urweb.lex
 	mllex $<
 
-urwebfmt: urweb.grm.sig urweb.grm.sml urweb.lex.sml parse_print.sml main.sml
-	mlton sources.mlb
+SOURCES=$(wildcard *.sml) $(wildcard *.sig)
+
+urwebfmt: urweb.grm.sig urweb.grm.sml urweb.lex.sml $(SOURCES)
+	mlton urwebfmt.mlb
+
+tests: urwebfmt
+	make -C tests cleanall
+	make -C tests

@@ -46,19 +46,22 @@ struct
       let val () = (ErrorMsg.resetErrors ();
                     ErrorMsg.resetPositioning filename;
                     UrWebLex.UserDeclarations.initialize ())
-          val printer = Print.openOut {dst = outf, wid = 80}
           val lexer = UrWebParser.makeLexer reader
 	  val dummyEOF = UrWebLrVals.Tokens.EOF(0,0)
 	  fun loop lexer =
 	      let val (result,lexer) = invoke lexer
 		  val (nextToken,lexer) = UrWebParser.Stream.get lexer
                   val pstr = SourcePrint.p_file result
-                  val _ = Print.fprint printer pstr
-                  val () = print ("comments: " ^ UrWebLex.UserDeclarations.getCommentsAsString ())
+                  val () = SourcePrint.renderToStream (outf, pstr)
+                                                      (*
+                  val comments = UrWebLex.UserDeclarations.getCommentsAsString ()
+                  val () = if comments <> "" then (print "\n"; print ("comments: " ^ comments); print "\n") else ()
+                                                      *)
+                  val () = TextIO.output (outf, "\n") (* print also the newline at end of file *)
 	      in if UrWebParser.sameToken(nextToken,dummyEOF) then ()
 		  else loop lexer
 	      end
-      in loop lexer; Print.PD.PPS.closeStream printer
+      in loop lexer
       end
 
   fun stdin_parse () =

@@ -3,6 +3,7 @@ local
   $(SML_LIB)/smlnj-lib/Util/smlnj-lib.mlb
   $(SML_LIB)/mlyacc-lib/mlyacc-lib.mlb
   $(SML_LIB)/smlnj-lib/PP/pp-lib.mlb
+  sml-final-pretty-printer/final-pretty-printer.mlb
 in
   list_util.sig
   list_util.sml

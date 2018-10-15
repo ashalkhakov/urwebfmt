@@ -32,3 +32,42 @@ invocation?
 urwebfmt <file> # probably outputs to stdout and stderr
 urwebfmt -i <file> # modify a file in-place
 cat file.ur | urwebfmt # takes stdin, outputs to stdout and stderr
+
+# the mystery of too much elaboration of function declarations
+
+this:
+
+fun f x = x
+
+turns into
+
+val rec f = fn x => x
+
+why and when??
+
+* `eargp` rule, takes a `pterm` (preterm?)
+* from `eargl2`, from `vali`
+
+what is earg(p)? what is carg(p)?
+- expression args and constructor args?
+- eargl is then expression argument list
+- eargp = expression argument pattern
+- earga = `[SYMBOL]` or `[SYMBOL ::_]`
+
+VAL pat eargl2 copt EQ eexp
+e.g. val f e1 e2 e3 : t = exp
+
+# using the new pretty-printing library
+
+well, devise some rules and try them out.
+
+will need at least 2 tests per language construct:
+- one test when there is enough space
+- another, when there is NOT enough space
+
+so that's like, LOTS of tests!
+
+# as of Oct 15, 2018
+
+- still have to figure out how the new PP library works
+- lackluster tests

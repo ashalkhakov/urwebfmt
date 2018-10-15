@@ -28,13 +28,18 @@
 (* Pretty-printing Ur/Web *)
 
 signature SOURCE_PRINT = sig
-    val p_kind : Source.kind Print.printer
-    val p_explicitness : Source.explicitness Print.printer
-    val p_con : Source.con Print.printer
-    val p_exp : Source.exp Print.printer
-    val p_decl : Source.decl Print.printer
-    val p_edecl : Source.edecl Print.printer
-    val p_sgn_item : Source.sgn_item Print.printer
-    val p_str : Source.str Print.printer
-    val p_file : Source.file Print.printer
+    type 'a m
+
+    val p_t : Prim.t -> unit m
+    val p_kind : Source.kind -> unit m
+    val p_explicitness : Source.explicitness -> unit m
+    val p_con : Source.con -> unit m
+    val p_exp : Source.exp -> unit m
+    val p_decl : Source.decl -> unit m
+    val p_edecl : Source.edecl -> unit m
+    val p_sgn_item : Source.sgn_item -> unit m
+    val p_str : Source.str -> unit m
+    val p_file : Source.file -> unit m
+
+    val renderToStream : TextIO.outstream * unit m -> unit
 end

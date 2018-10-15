@@ -16,7 +16,7 @@
  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
  * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR 
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
  * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
  * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
  * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
@@ -36,7 +36,9 @@ val openOut = SM.openOut
 
 type 'a printer = 'a -> PD.pp_desc
 
-fun box ds = PD.hovBox (PD.PPS.Rel 1, ds)
+fun hbox ds = PD.hBox ds
+fun sameIndent ds = PD.box (PD.PPS.Rel 0, ds)
+fun box ds = PD.box (PD.PPS.Rel 2, ds)
 fun parenIf b d =
     if b then
         box [PD.string "(", d, PD.string ")"]
@@ -57,9 +59,9 @@ fun p_list_sep sep f ls =
                                    sep :: PD.cut :: f x :: tokens)
                                [] rest
         in
-            box (f x :: tokens)
+            sameIndent (f x :: tokens)
         end
-fun p_list f = p_list_sep (box [PD.string ",", space]) f
+fun p_list f = p_list_sep (sameIndent [PD.string ",", space]) f
 
 fun p_list_sepi sep f ls =
     case ls of
@@ -71,7 +73,7 @@ fun p_list_sepi sep f ls =
                                              sep :: PD.cut :: f (n + 1) x :: tokens)
                                          [] rest
         in
-            box (f 0 x :: tokens)
+            sameIndent (f 0 x :: tokens)
         end
 
 fun fprint f d = (PD.description (f, d);

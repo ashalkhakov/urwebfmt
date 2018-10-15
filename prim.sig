@@ -26,7 +26,6 @@
  *)
 
 signature PRIM = sig
-
     datatype string_mode = Normal | Html
 
     datatype t =
@@ -35,9 +34,9 @@ signature PRIM = sig
            | String of string_mode * string
            | Char of char
 
-
-    val p_t : t Print.printer
 (*
+    val p_t : t -> unit m
+
     val p_t_GCC : t Print.printer
 *)
 

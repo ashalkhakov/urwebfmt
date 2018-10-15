@@ -41,6 +41,8 @@ datatype kind' =
        | KFun of string * kind
        | KVar of string
 
+       | KParen of kind (* simply parentheses *)
+
 withtype kind = kind' located
 
 datatype explicitness =
@@ -75,12 +77,34 @@ datatype con' =
 
        | CWild of kind
 
+       | CParen of con (* simply parens *)
+
 withtype con = con' located
 
 datatype inference =
          Infer
        | DontInfer
        | TypesOnly
+
+datatype unop = Uneg
+
+datatype binop =
+         Borelse (* || *)
+         | Bandalso (* && *)
+         | Bcaret (* strcat *)
+         | Bcons (* :: *)
+         | Beq (* = *)
+         | Bne (* <> *)
+         | Bplus (* + *)
+         | Bminus (* - *)
+         | Bmult (* * *)
+         | Bdiv (* / *)
+         | Bmod (* % *)
+         | Blt (* < *)
+         | Ble (* <= *)
+         | Bgt (* > *)
+         | Bge (* >= *)
+         | Bsemi (* ; *)
 
 datatype sgn_item' =
          SgiConAbs of string * kind
@@ -106,39 +130,53 @@ and sgn' =
 and pat' =
     PVar of string
   | PPrim of Prim.t
-  | PCon of string list * string * pat option
+  | PCon of string list(* module path *) * string(* identifier *) * pat option(* optional pattern *)
   | PRecord of (string * pat) list * bool
   | PAnnot of pat * con
+  | PCVar of explicitness * string * kind (* constructor variable binding, e.g. [x] in function args *)
+  | PDisjoint of (con * con) (* record disjointness obligation, e.g. as in [x ~ y] *)
+  | PKVar of string (* kind variable *)
+  | PParen of pat (* simply parens *)
 
 and exp' =
     EAnnot of exp * con
 
-  | EPrim of Prim.t
-  | EVar of string list * string * inference
-  | EApp of exp * exp
-  | EAbs of string * con option * exp
-  | ECApp of exp * con
-  | ECAbs of explicitness * string * kind * exp
-  | EDisjoint of con * con * exp
-  | EDisjointApp of exp
+    | EPrim of Prim.t
 
-  | EKAbs of string * exp
+    | EUnOp of unop * exp
+    | EBinOp of binop * exp * exp
+    | ENil
 
-  | ERecord of (con * exp) list * bool
-  | EField of exp * con
-  | EConcat of exp * exp
-  | ECut of exp * con
-  | ECutMulti of exp * con
+    | EVar of string list * string * inference
+    | EApp of exp * exp
+    | EAbs of pat list * con option * exp
+    | ECApp of exp * con
+    | ECAbs of explicitness * string * kind * exp
+    | EDisjoint of con * con * exp
+    | EDisjointApp of exp
 
-  | EWild
+    | EKAbs of string * exp
 
-  | ECase of exp * (pat * exp) list
+    | ERecord of (con * exp) list * bool
+    | EField of exp * con
+    | EConcat of exp * exp
+    | ECut of exp * con
+    | ECutMulti of exp * con
 
-  | ELet of edecl list * exp
+    | EWild
+
+    | ECase of exp * (pat * exp) list
+    | EIf of exp * exp * exp
+
+    | ELet of edecl list * exp
+
+    | EParen of exp (* simply parens *)
 
 and edecl' =
     EDVal of pat * exp
-  | EDValRec of (string * con option * exp) list
+    | EDValRec of (string * pat list * con option * exp) list
+    | EDFun of string * pat list * con option * exp
+    | EDFunRec of (string * pat list * con option * exp) list
 
 withtype sgn_item = sgn_item' located
 and sgn = sgn' located
@@ -158,7 +196,9 @@ datatype decl' =
        | DDatatype of (string * string list * (string * con option) list) list (* data type declaration: name, parameters, constructors *)
        | DDatatypeImp of string * string list * string
        | DVal of pat * exp
-       | DValRec of (string * con option * exp) list
+       | DFun of string * (pat list) * con option * exp
+       | DValRec of (string * pat list * con option * exp) list
+       | DFunRec of (string * pat list * con option * exp) list
        | DSgn of string * sgn
        | DStr of string * sgn option * Time.time option * str * bool (* did this module come from the '-root' directive? *)
        | DFfiStr of string * sgn * Time.time option
